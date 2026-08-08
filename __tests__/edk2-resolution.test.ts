@@ -361,3 +361,42 @@ describe('edk2Resolver — PCD Bool/Size variants', () => {
     expect(out.references.every((r) => r.referenceKind === 'references')).toBe(true);
   });
 });
+
+describe('edk2Resolver — STRING_TOKEN (HII string usage)', () => {
+  it('extracts STRING_TOKEN refs from C content', () => {
+    const src = `EFI_STRING s = HiiGetString (hii, STRING_TOKEN (STR_LI_DUMP_NAME), NULL);
+if (Token == STRING_TOKEN (STR_GOP_DUMP_MAIN)) {}
+`;
+    const out = edk2Resolver.extract('Pkg/Drv/Drv.c', src);
+    const names = out.references.map((r) => r.referenceName);
+    expect(names).toContain('STR_LI_DUMP_NAME');
+    expect(names).toContain('STR_GOP_DUMP_MAIN');
+    expect(out.references.every((r) => r.referenceKind === 'references')).toBe(true);
+  });
+
+  it('resolves a STRING_TOKEN ref to the UNI constant by simple name', () => {
+    const uniTok = mkConstant(
+      'STR_LI_DUMP_NAME',
+      'Pkg/Drv/DrvStrings.uni::STR_LI_DUMP_NAME',
+      'Pkg/Drv/DrvStrings.uni',
+      30
+    );
+    const ctx = {
+      ...baseContext(),
+      getNodesByName: (n: string) => (n === 'STR_LI_DUMP_NAME' ? [uniTok] : []),
+    };
+    const ref: UnresolvedRef = {
+      fromNodeId: 'file:Pkg/Drv/Drv.c',
+      referenceName: 'STR_LI_DUMP_NAME',
+      referenceKind: 'references',
+      line: 10,
+      column: 30,
+      filePath: 'Pkg/Drv/Drv.c',
+      language: 'c',
+    };
+    const result = edk2Resolver.resolve(ref, ctx as never);
+    expect(result?.targetNodeId).toBe(uniTok.id);
+    expect(result?.resolvedBy).toBe('framework');
+    expect(result?.confidence).toBeGreaterThanOrEqual(0.9);
+  });
+});

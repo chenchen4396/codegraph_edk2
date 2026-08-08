@@ -46,6 +46,10 @@ const PCD_USAGE_RE =
 
 const GUID_USAGE_RE = /\b(g(?:Efi|Edkii)[A-Za-z0-9_]*(?:ProtocolGuid|PpiGuid|Guid))\b/g;
 
+// HII string-token usage: `STRING_TOKEN (STR_X)` in C — the token is declared
+// as a constant in a `.uni` file (same simple-name contract as PCD/GUID).
+const STRING_TOKEN_RE = /\bSTRING_TOKEN\s*\(\s*([A-Za-z0-9_]+)\s*\)/g;
+
 const DESCRIPTOR_EXT = /\.(dec|inf|dsc|fdf)(?:\.inc)?$/i;
 const SOURCE_EXT = /\.(c|cc|cpp)$/i;
 
@@ -177,7 +181,8 @@ export const edk2Resolver: FrameworkResolver = {
     if (
       content.indexOf('Pcd') === -1 &&
       content.indexOf('gEfi') === -1 &&
-      content.indexOf('gEdkii') === -1
+      content.indexOf('gEdkii') === -1 &&
+      content.indexOf('STRING_TOKEN') === -1
     ) {
       return { nodes: [], references: [] };
     }
@@ -236,6 +241,12 @@ export const edk2Resolver: FrameworkResolver = {
     // GUID / Protocol / PPI usage: `gEfiArpProtocolGuid`, `gEfiDxeIplPpiGuid`.
     GUID_USAGE_RE.lastIndex = 0;
     while ((m = GUID_USAGE_RE.exec(content)) !== null) {
+      emit(m[1]!, undefined, m.index);
+    }
+
+    // HII string tokens: `STRING_TOKEN (STR_CAP_ARCH)` → the `.uni` constant.
+    STRING_TOKEN_RE.lastIndex = 0;
+    while ((m = STRING_TOKEN_RE.exec(content)) !== null) {
       emit(m[1]!, undefined, m.index);
     }
 
