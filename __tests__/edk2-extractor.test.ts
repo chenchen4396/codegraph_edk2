@@ -887,3 +887,72 @@ describe('Edk2Extractor — Round 4b: lowercase DSC', () => {
     expect(pcd).toBeDefined();
   });
 });
+
+describe('Edk2Extractor — round-8 generality: !include, comments, nested macros, .inc routing', () => {
+  it('INF raw !include emits an imports ref (workspace-relative spelling)', () => {
+    const src = `## @file
+[Defines]
+  BASE_NAME = SharedDrv
+  MODULE_TYPE = DXE_DRIVER
+  !include VendorPkg/SharedDefines.inc
+
+[Sources]
+  SharedDrv.c
+`;
+    const result = extractFromSource('VendorPkg/SharedDrv/SharedDrv.inf', CRLF(src), 'edk2');
+    const names = result.unresolvedReferences.map((r) => r.referenceName);
+    // build tools resolve !include against the including file's dir first,
+    // then the workspace root — emitted workspace-relative, resolver tries
+    // both (dir-joined fallback covered in the integration suite)
+    expect(names).toContain('VendorPkg/SharedDefines.inc');
+  });
+
+  it('FDF INF line with trailing # comment still emits the import', () => {
+    const src = `[FV.FvMain]
+  INF Platform/Drv.inf # first driver
+  INF FILE_GUID = A1B2C3D4-0000-0000-0000-000000000000 VendorPkg/Blk/Blk.inf ## second
+`;
+    const result = extractFromSource('Platform/Platform.fdf', CRLF(src), 'edk2');
+    const names = result.unresolvedReferences.map((r) => r.referenceName);
+    expect(names).toContain('Platform/Drv.inf');
+    expect(names).toContain('VendorPkg/Blk/Blk.inf');
+  });
+
+  it('VFR #include inside a line comment is not an import', () => {
+    const src = `#include "SharedForm.vfr" // real include
+// #include "Ghost.vfr" — commented out, must NOT link
+formset
+  title = STRING_TOKEN(STR_FORM_TITLE);
+  form formid = 1
+    subtitle text = STRING_TOKEN(STR_SUB);
+  endform;
+endformset;
+`;
+    const result = extractFromSource('VendorPkg/Drv/Drv.vfr', CRLF(src), 'edk2');
+    const names = result.unresolvedReferences.map((r) => r.referenceName);
+    expect(names).toContain('VendorPkg/Drv/SharedForm.vfr');
+    expect(names).not.toContain('VendorPkg/Drv/Ghost.vfr');
+  });
+
+  it('nested DEFINE macros expand recursively', () => {
+    const src = `[Defines]
+  PLATFORM_NAME = NestTest
+  DEFINE BASE = VendorPkg
+  DEFINE LIBS = $(BASE)/Library
+
+[Components]
+  $(LIBS)/QueueLib/QueueLib.inf
+`;
+    const result = extractFromSource('Platform/Nest.dsc', CRLF(src), 'edk2');
+    const names = result.unresolvedReferences.map((r) => r.referenceName);
+    expect(names).toContain('VendorPkg/Library/QueueLib/QueueLib.inf');
+  });
+
+  it('bare .inc routes by content: NASM macro shape → assembly, <?php → php', () => {
+    expect(detectLanguage('MdePkg/Include/CommonMacros.inc', '%define FIXED_VECTOR 0x10\n')).toBe('assembly');
+    expect(detectLanguage('MdePkg/Include/Ia32/Nasm.inc', ';------------------------------------------------------------------------------\n%define RBP rbp\n')).toBe('assembly');
+    expect(detectLanguage('app/config.inc', '<?php\nreturn [];\n')).toBe('php');
+    // plain text with neither shape keeps the PHP default (previous behavior)
+    expect(detectLanguage('odd.inc', 'just some text\n')).toBe('php');
+  });
+});

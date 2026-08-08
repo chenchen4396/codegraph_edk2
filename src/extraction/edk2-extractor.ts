@@ -146,18 +146,26 @@ export class Edk2Extractor {
   /** Expand `$(NAME)` build macros in a path (INF/DSC [Defines] `DEFINE NAME =
    * value` lines). `MODULE_NAME` is defined by the build system as BASE_NAME
    * (INF only). Unknown macros stay verbatim — the resolver's fileExists gate
-   * drops them. */
+   * drops them. Macro values may reference earlier macros
+   * (`DEFINE A = $(B)/x`), so expansion iterates to a fixpoint (depth-capped;
+   * EDK2 build tools expand recursively too). */
   private expandMacros(
     p: string,
     macros: Map<string, string>,
     defines?: Map<string, string>
   ): string {
     const moduleName = defines?.get('BASE_NAME');
-    return p.replace(/\$\(([A-Za-z0-9_]+)\)/g, (whole, name: string) => {
-      if (name === 'MODULE_NAME' && moduleName) return moduleName;
-      const v = macros.get(name);
-      return v !== undefined ? v : whole;
-    });
+    let out = p;
+    for (let depth = 0; depth < 5; depth++) {
+      const next = out.replace(/\$\(([A-Za-z0-9_]+)\)/g, (whole, name: string) => {
+        if (name === 'MODULE_NAME' && moduleName) return moduleName;
+        const v = macros.get(name);
+        return v !== undefined ? v : whole;
+      });
+      if (next === out) break;
+      out = next;
+    }
+    return out;
   }
 
   private emitRef(
@@ -400,6 +408,18 @@ export class Edk2Extractor {
         const defLine = this.findDefinesLine(key) || moduleLine;
         this.emitRef(from, v, 'references', defLine, sources.length ? sources : undefined);
       }
+    }
+
+    // `!include "SharedDefines.inc"` — INFs splice shared [Defines]-level
+    // macros from other files (the build preprocessor, same as DSC/FDF);
+    // splitSections' `!` skip drops them, so scan raw lines. Macros defined
+    // inside an included file aren't visible here — the included file's own
+    // fragment parse emits its linkage, and unresolved macro paths stay
+    // verbatim (dropped by the resolver's fileExists gate).
+    const rawLines = this.source.split('\n');
+    for (let i = 0; i < rawLines.length; i++) {
+      const inc = rawLines[i]!.match(/^\s*!include\s+(\S+)/);
+      if (inc) this.emitRef(from, this.expandMacros(inc[1]!, macros, defines), 'imports', i + 1);
     }
   }
 
@@ -677,16 +697,18 @@ export class Edk2Extractor {
     // `INF [RuleOverride=…] [FILE_GUID = <guid>] path.inf` — both modifiers
     // may appear before the module path (OvmfPkgX64.fdf overrides module
     // FILE_GUIDs this way: `INF FILE_GUID = $(UP_CPU_PEI_GUID)
-    // UefiCpuPkg/CpuMpPei/CpuMpPei.inf`).
+    // UefiCpuPkg/CpuMpPei/CpuMpPei.inf`). Inline `#` comments after the path
+    // are stripped first (FDF supports them anywhere on the line).
     const re = /^\s*INF\s+(?:(?:RuleOverride|FILE_GUID)\s*=\s*\S+\s+)*(\S+\.inf)\s*$/i;
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i]!;
-      const inc = line.match(/^\s*!include\s+(\S+)/);
+      const noComment = line.replace(/\s#.*$/, '');
+      const inc = noComment.match(/^\s*!include\s+(\S+)/);
       if (inc) {
         this.emitRef(this.fileNodeId, this.expandMacros(inc[1]!, macros), 'imports', i + 1);
         continue;
       }
-      const m = line.match(re);
+      const m = noComment.match(re);
       if (m) this.emitRef(this.fileNodeId, this.expandMacros(m[1]!, macros), 'imports', i + 1);
     }
   }
@@ -819,11 +841,12 @@ export class Edk2Extractor {
       .replace(/\/\/[^\n]*/g, (m) => ' '.repeat(m.length));
 
     // `#include "X.vfr"` — VFR files share forms/structures across drivers
-    // (NetworkPkg Ip4Config2.vfr pattern).
+    // (NetworkPkg Ip4Config2.vfr pattern). Matched on the comment-stripped
+    // text so a `// #include …` comment can't mint a fake import.
     const incRe = /^\s*#include\s+["<]([^">]+)[">]/gm;
     let incM: RegExpExecArray | null;
-    while ((incM = incRe.exec(this.source)) !== null) {
-      const incLine = this.source.slice(0, incM.index).split('\n').length;
+    while ((incM = incRe.exec(stripped)) !== null) {
+      const incLine = stripped.slice(0, incM.index).split('\n').length;
       this.emitRef(this.fileNodeId, this.rel(incM[1]!), 'imports', incLine);
     }
 

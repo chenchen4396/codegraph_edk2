@@ -355,3 +355,119 @@ describe('EDK2 ASL: asl/aslc sources + nasm.inc routing', () => {
     expect(inc!.language).toBe('assembly');
   });
 });
+
+describe('EDK2 round-8: generality across any EDK2 tree', () => {
+  let dir: string;
+  let cg: CodeGraph;
+
+  beforeAll(async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'edk2-r8-'));
+    // Uppercase .DEC extension + uppercase section headers — legal EDK2
+    // spelling; resolver detect() and DEC parsing must not care.
+    fs.mkdirSync(path.join(dir, 'MdePkg'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'MdePkg/MdePkg.DEC'),
+      '[DEFINES]\n  PACKAGE_NAME = MdePkg\n\n[PCDSFIXEDATBUILD]\n  gEfiMdePkgTokenSpaceGuid.PcdDebugPropertyMask|0x0f|UINT8|0x0d\n'.replace(/\n/g, '\r\n')
+    );
+    // -I-relative include target under the default Include/ layout
+    fs.mkdirSync(path.join(dir, 'MdePkg/Include/Register/RiscV64'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'MdePkg/Include/Register/RiscV64/RiscVImpl.h'), '#pragma once\ntypedef struct { UINT64 Value; } RISCV_IMPL;\n');
+    // bare .inc NASM macro fragment (must be assembly, not php)
+    fs.mkdirSync(path.join(dir, 'MdePkg/Include'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'MdePkg/Include/CommonMacros.inc'), '%define FIXED_VECTOR 0x10\n');
+    // RISC-V .S including the header -I-style (BaseLib/RiscV64 pattern)
+    fs.mkdirSync(path.join(dir, 'MdePkg/Library/BaseLib/RiscV64'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'MdePkg/Library/BaseLib/RiscV64/RiscVMmu.S'),
+      '#include "Register/RiscV64/RiscVImpl.h"\n\n.text\n.globl RiscVMmu\nRiscVMmu:\n  ret\n'.replace(/\n/g, '\r\n')
+    );
+    fs.writeFileSync(
+      path.join(dir, 'MdePkg/Library/BaseLib/RiscV64/RiscVMmu.inf'),
+      '[Defines]\n  BASE_NAME = RiscVMmu\n  MODULE_TYPE = BASE\n\n[Sources]\n  RiscVMmu.S\n'.replace(/\n/g, '\r\n')
+    );
+    // Same-package priority: two DECs declare gVendorSharedGuid; the
+    // referencing INF lives in VendorPkg and must link to VendorPkg's DEC.
+    fs.mkdirSync(path.join(dir, 'VendorPkg/Drv'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'VendorPkg/VendorPkg.dec'),
+      '[Defines]\n  PACKAGE_NAME = VendorPkg\n\n[Guids]\n  gVendorSharedGuid = { 0x11111111 }\n'.replace(/\n/g, '\r\n')
+    );
+    fs.writeFileSync(
+      path.join(dir, 'MdePkg/OtherPkg.dec'),
+      '[Defines]\n  PACKAGE_NAME = OtherPkg\n\n[Guids]\n  gVendorSharedGuid = { 0x22222222 }\n'.replace(/\n/g, '\r\n')
+    );
+    // Duplicate GUID constants prefer the referencing package
+    fs.writeFileSync(
+      path.join(dir, 'VendorPkg/Drv/Drv.inf'),
+      '[Defines]\n  BASE_NAME = Drv\n  MODULE_TYPE = DXE_DRIVER\n\n[Packages]\n  MdePkg/MdePkg.dec\n  VendorPkg/VendorPkg.dec\n\n[Guids]\n  gVendorSharedGuid\n'.replace(/\n/g, '\r\n')
+    );
+    // !include written relative to the including file's dir (build tools try
+    // the file dir first, then the workspace root)
+    fs.writeFileSync(
+      path.join(dir, 'VendorPkg/SharedDefines.inc'),
+      'DEFINE LOCAL_FLAG = 1\n'
+    );
+    fs.writeFileSync(
+      path.join(dir, 'VendorPkg/IncDrv.inf'),
+      '[Defines]\n  BASE_NAME = IncDrv\n  MODULE_TYPE = DXE_DRIVER\n  !include SharedDefines.inc\n'.replace(/\n/g, '\r\n')
+    );
+
+    cg = await CodeGraph.init(dir, { index: false });
+    await cg.indexAll();
+  });
+
+  afterAll(() => {
+    cg?.destroy();
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('resolver detects an EDK2 tree with an uppercase .DEC', () => {
+    const decModule = cg.queries.getNodesByName('MdePkg').find((n) => n.kind === 'module' && n.language === 'edk2');
+    expect(decModule).toBeDefined();
+    // PCD declared in the uppercase DEC resolved from C would need a C file;
+    // the DEC constant itself proves DEC parsing worked.
+    const pcd = cg.queries.getNodesByName('PcdDebugPropertyMask').find((n) => n.kind === 'constant' && n.language === 'edk2');
+    expect(pcd).toBeDefined();
+  });
+
+  it('-I-relative assembly include resolves through the Include/ layout', () => {
+    const asm = cg.queries.getNodesByFile('MdePkg/Library/BaseLib/RiscV64/RiscVMmu.S').find((n) => n.kind === 'file');
+    const header = cg.queries.getNodesByFile('MdePkg/Include/Register/RiscV64/RiscVImpl.h').find((n) => n.kind === 'file');
+    expect(asm).toBeDefined();
+    expect(header).toBeDefined();
+    if (asm && header) {
+      const edges = cg.queries.getOutgoingEdges(asm.id);
+      expect(edges.some((e) => e.kind === 'imports' && e.target === header.id)).toBe(true);
+    }
+  });
+
+  it('bare .inc NASM fragment is indexed as assembly', () => {
+    const inc = cg.queries.getNodesByFile('MdePkg/Include/CommonMacros.inc').find((n) => n.kind === 'file');
+    expect(inc).toBeDefined();
+    expect(inc!.language).toBe('assembly');
+  });
+
+  it('duplicate GUID constants prefer the referencing package', () => {
+    const infModule = cg.queries.getNodesByName('Drv').find((n) => n.kind === 'module');
+    const vendorConst = cg.queries
+      .getNodesByName('gVendorSharedGuid')
+      .find((n) => n.kind === 'constant' && n.filePath.startsWith('VendorPkg/'));
+    expect(infModule).toBeDefined();
+    expect(vendorConst).toBeDefined();
+    if (infModule && vendorConst) {
+      const edges = cg.queries.getOutgoingEdges(infModule.id);
+      expect(edges.some((e) => e.kind === 'references' && e.target === vendorConst.id)).toBe(true);
+    }
+  });
+
+  it('INF !include relative to the including dir resolves (dir-joined fallback)', () => {
+    const infModule = cg.queries.getNodesByName('IncDrv').find((n) => n.kind === 'module');
+    const incFile = cg.queries.getNodesByFile('VendorPkg/SharedDefines.inc').find((n) => n.kind === 'file');
+    expect(infModule).toBeDefined();
+    expect(incFile).toBeDefined();
+    if (infModule && incFile) {
+      const edges = cg.queries.getOutgoingEdges(infModule.id);
+      expect(edges.some((e) => e.kind === 'imports' && e.target === incFile.id)).toBe(true);
+    }
+  });
+});

@@ -516,6 +516,19 @@ export function detectLanguage(filePath: string, source?: string, overrides?: Re
   // NASM include fragments (`PageTables64.nasm.inc`) — assembly syntax spliced
   // into .nasm sources via `%include`.
   if (/\.nasm\.inc$/i.test(filePath)) return 'assembly';
+  // Bare `.inc` files: PHP templates (`<?php`) vs. EDK2 fragments — NASM
+  // macro snippets (`%define`/`%macro`/`;`-comment shape — MdePkg/Include/*.inc,
+  // *Nasm.inc in every EDK2 package) and descriptor fragments spliced via
+  // `!include` (`DEFINE NAME = value` lines — EDK2-only syntax). EDK2's .inc
+  // files must be assembly/edk2-language file nodes or the include edge and
+  // language label are wrong (PHP extractor would burn a parse on them).
+  // Content-gated: `<?php` wins; `%`-directive/`;`-comment-led lines are never
+  // valid PHP; a `DEFINE X =` line is EDK2 build syntax; else PHP.
+  if (ext === '.inc' && source) {
+    if (/^\s*<\?php/i.test(source)) return 'php';
+    if (/^\s*%/m.test(source) || /^\s*;/m.test(source)) return 'assembly';
+    if (/^\s*DEFINE\s+[A-Za-z0-9_]+\s*=/m.test(source)) return 'edk2';
+  }
   const lang = (overrides && overrides[ext]) || EXTENSION_MAP[ext] || 'unknown';
 
   // .h files could be C, C++, or Objective-C — check source content

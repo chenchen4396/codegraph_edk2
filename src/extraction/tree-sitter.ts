@@ -6755,28 +6755,36 @@ export function extractFromSource(
     };
     // NASM `%include "fragment.nasm.inc"` and GNU-as `#include "AsmMacroIoLib.inc"`
     // (ARM/RISC-V .S sources) — link the macro fragment (indexed as an
-    // assembly file node) to its includer. Paths are relative to the including
-    // file (corpus: `Ia32/Flat32ToFlat64.nasm.inc` from ResetVector, ARM
-    // `#include "AsmMacroIoLib.inc"`); the edk2 resolver resolves the
-    // dir-joined path via fileExists.
+    // assembly file node) to its includer. EDK2 builds pass `-I` include dirs
+    // (MdePkg/Include, …), so an include name is EITHER relative to the
+    // including file OR relative to a declared include dir (`Register/….h` in
+    // BaseLib's .S files, `AArch64/AArch64.h` in ArmLib) — emit both forms;
+    // the edk2 resolver resolves each via fileExists / the include index
+    // (relative-join wins when both exist — NASM's search order).
     const dir = path.dirname(filePath) === '.' ? '' : path.dirname(filePath);
     const unresolvedReferences: UnresolvedReference[] = [];
     const includeRe = /^\s*#?%?include\s+["<]([^">]+)[">]/gm;
     let incM: RegExpExecArray | null;
     while ((incM = includeRe.exec(source)) !== null) {
-      const target = dir
-        ? path.posix.join(dir, incM[1]!).replace(/\\/g, '/')
-        : incM[1]!;
+      const raw = incM[1]!;
+      const joined = dir ? path.posix.join(dir, raw).replace(/\\/g, '/') : raw;
       const line = source.slice(0, incM.index).split('\n').length;
-      unresolvedReferences.push({
-        fromNodeId: fileNode.id,
-        referenceName: target,
-        referenceKind: 'imports',
-        line,
-        column: incM.index - (source.lastIndexOf('\n', incM.index - 1) + 1),
-        filePath,
-        language: 'assembly',
-      });
+      const column = incM.index - (source.lastIndexOf('\n', incM.index - 1) + 1);
+      const emit = (referenceName: string) =>
+        unresolvedReferences.push({
+          fromNodeId: fileNode.id,
+          referenceName,
+          referenceKind: 'imports',
+          line,
+          column,
+          filePath,
+          language: 'assembly',
+        });
+      emit(joined);
+      // Path-shaped raw names only: a bare filename would hit the same
+      // include-index entries as the joined ref (double edge when the
+      // includer's own dir has the fragment AND MdePkg/Include does).
+      if (raw.includes('/') && raw !== joined) emit(raw);
     }
     result = {
       nodes: [fileNode],

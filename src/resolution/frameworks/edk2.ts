@@ -97,7 +97,7 @@ function buildIncludeIndex(context: ResolutionContext): Map<string, string[]> {
   // the DEC file's own directory).
   const decDirs = new Set<string>();
   for (const n of context.getNodesByKind('module')) {
-    if (n.language !== 'edk2' || !n.filePath.endsWith('.dec')) continue;
+    if (n.language !== 'edk2' || !n.filePath.toLowerCase().endsWith('.dec')) continue;
     const content = context.readFile(n.filePath);
     if (!content) continue;
     const decDir = path.posix.dirname(n.filePath);
@@ -134,7 +134,7 @@ export const edk2Resolver: FrameworkResolver = {
   languages: ['edk2', 'c'],
 
   detect(context: ResolutionContext): boolean {
-    return context.getAllFiles().some((f) => f.endsWith('.dec'));
+    return context.getAllFiles().some((f) => f.toLowerCase().endsWith('.dec'));
   },
 
   // Path-shaped descriptor imports (`MdePkg/MdePkg.dec`, `Rules.fdf.inc`) name
@@ -190,14 +190,28 @@ export const edk2Resolver: FrameworkResolver = {
         .replace(/^\$\(WORKSPACE\)\//, '')
         .replace(/^\$\(EDK_TOOLS_PATH\)\//, 'BaseTools/');
       let cand = context.fileExists(expanded) ? expanded : null;
-      if (!cand && name.endsWith('.h')) {
-        // `<pkg>/Include/<name>` layout fallback (see buildIncludeIndex).
+      if (!cand) {
+        // EDK2 build tools resolve `!include` paths relative to the including
+        // file's directory FIRST, then the workspace root (MetaFileParser:
+        // PathClass(IncludedFile, self.MetaFile.Dir) → gWorkspace). Descriptor
+        // refs are emitted workspace-relative; try the including-file-relative
+        // spelling when the workspace-relative one misses.
+        const refDir = ref.filePath ? path.dirname(ref.filePath) : '';
+        const joined = refDir ? path.posix.join(refDir, expanded) : '';
+        if (joined && context.fileExists(joined)) cand = joined;
+      }
+      if (!cand) {
+        // `<pkg>/Include/<name>` layout fallback (see buildIncludeIndex) —
+        // for C headers AND assembly/ASL include targets (`Register/….h`,
+        // `AArch64.h`, `CommonMacros.inc`): EDK2 builds pass `-I` include dirs
+        // (MdePkg/Include, …), so an include name is relative to any declared
+        // include dir, not necessarily the including file. Map miss → O(1).
         let index = includeIndex.get(context);
         if (!index) {
           index = buildIncludeIndex(context);
           includeIndex.set(context, index);
         }
-        const hits = index.get(name);
+        const hits = index.get(expanded);
         if (hits && hits.length > 0) {
           // Prefer the candidate from the including file's own package
           // (ShellPkg code must get ShellPkg's header, not MdeModulePkg's).
@@ -229,16 +243,23 @@ export const edk2Resolver: FrameworkResolver = {
     // GUID / PCD / library-class by simple name → DEC constant. STRING_TOKEN
     // names (STR_MODULE_ABSTRACT etc.) are declared in every module's own
     // .uni — prefer the constant in the referencing file's directory before
-    // falling back to the first declaration.
+    // falling back to the first declaration. For package-level constants
+    // (GUIDs), prefer a declaration in the referencing file's own package
+    // (a vendor fork may redeclare a GUID in its own DEC).
     const hits = context
       .getNodesByName(name)
       .filter((n) => n.kind === 'constant' && n.language === 'edk2');
     if (hits.length > 0) {
       const refDir = ref.filePath ? path.dirname(ref.filePath) : '';
+      const refPkg = ref.filePath?.split('/')[0];
       const local = refDir
         ? hits.find((n) => path.dirname(n.filePath) === refDir)
         : undefined;
-      const target = local ?? hits[0]!;
+      const samePkg =
+        refPkg && !local
+          ? hits.find((n) => n.filePath.startsWith(refPkg + '/'))
+          : undefined;
+      const target = local ?? samePkg ?? hits[0]!;
       return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'framework' };
     }
 
