@@ -42,12 +42,33 @@ import type {
 } from '../types';
 
 const PCD_USAGE_RE =
-  /\b(?:Pcd|FixedPcd|PatchPcd)(?:Get|Set)(?:8|16|32|64|Ptr)?S?\s*\(\s*(?:&\s*)?(?:([A-Za-z0-9_]+)PkgTokenSpaceGuid\s*\.)?\s*(Pcd[A-Za-z0-9_]+)\b/g;
+  /\b(?:Pcd|FixedPcd|PatchPcd)(?:Get|Set)(?:Ex)?(?:8|16|32|64|Ptr|Size|Bool)?S?\s*\(\s*(?:&\s*)?(?:([A-Za-z0-9_]+)PkgTokenSpaceGuid\s*\.)?\s*(Pcd[A-Za-z0-9_]+)\b/g;
 
 const GUID_USAGE_RE = /\b(g(?:Efi|Edkii)[A-Za-z0-9_]*(?:ProtocolGuid|PpiGuid|Guid))\b/g;
 
-const DESCRIPTOR_EXT = /\.(dec|inf|dsc|fdf)$/i;
+const DESCRIPTOR_EXT = /\.(dec|inf|dsc|fdf)(?:\.inc)?$/i;
 const SOURCE_EXT = /\.(c|cc|cpp)$/i;
+
+/**
+ * Per-project map of `#include <...>` name → indexed `<pkg>/Include/...`
+ * header paths, built lazily from the file nodes on first C-include resolve.
+ * EDK2 packages declare their `[Includes]` dirs (MdePkg: `Include`), so a
+ * header `Uefi.h` lives at `MdePkg/Include/Uefi.h` — root-relative lookups
+ * miss it. One pass over the file nodes per project, then O(1) per ref.
+ */
+const includeIndex = new WeakMap<ResolutionContext, Map<string, string[]>>();
+function buildIncludeIndex(context: ResolutionContext): Map<string, string[]> {
+  const index = new Map<string, string[]>();
+  for (const n of context.getNodesByKind('file')) {
+    const m = /\/Include\/(.+)$/.exec(n.filePath);
+    if (m) {
+      const arr = index.get(m[1]!);
+      if (arr) arr.push(n.filePath);
+      else index.set(m[1]!, [n.filePath]);
+    }
+  }
+  return index;
+}
 
 export const edk2Resolver: FrameworkResolver = {
   name: 'edk2',
@@ -57,11 +78,13 @@ export const edk2Resolver: FrameworkResolver = {
     return context.getAllFiles().some((f) => f.endsWith('.dec'));
   },
 
-  // Path-shaped descriptor imports (e.g. `MdePkg/MdePkg.dec`) name a FILE, not
-  // a declared symbol — opt them through the name-exists pre-filter so they
-  // reach resolve() at all (terraform's `claimsReference` for scoped refs).
+  // Path-shaped descriptor imports (`MdePkg/MdePkg.dec`, `Rules.fdf.inc`) name
+  // a FILE, not a declared symbol — opt them through the name-exists
+  // pre-filter so they reach resolve() at all (terraform's `claimsReference`
+  // for scoped refs). Also C `#include <...>` targets (`Uefi.h`,
+  // `Protocol/Arp.h`): their native import refs die in the pre-filter today.
   claimsReference(name: string): boolean {
-    return DESCRIPTOR_EXT.test(name);
+    return DESCRIPTOR_EXT.test(name) || name.includes('/') || name.endsWith('.h');
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
@@ -91,10 +114,26 @@ export const edk2Resolver: FrameworkResolver = {
       return null;
     }
 
-    // Path-shaped imports → the target descriptor file's module/file node.
-    if (DESCRIPTOR_EXT.test(name)) {
-      if (!context.fileExists(name)) return null;
-      const inFile = context.getNodesInFile(name);
+    // Path-shaped imports → the target descriptor file's module/file node
+    // (descriptor paths, `!include` fragments, and C `#include <...>` targets).
+    // Angle-bracket headers resolve against EDK2's default layout
+    // (`Include/<name>` — MdePkg/NetworkPkg/MdeModulePkg all declare a single
+    // `[Includes]` dir); quoted includes resolve via the normal import resolver
+    // (root-relative fileExists fails here → null → no duplicate edge).
+    if (DESCRIPTOR_EXT.test(name) || name.includes('/') || name.endsWith('.h')) {
+      let cand = context.fileExists(name) ? name : null;
+      if (!cand && name.endsWith('.h')) {
+        // `<pkg>/Include/<name>` layout fallback (see buildIncludeIndex).
+        let index = includeIndex.get(context);
+        if (!index) {
+          index = buildIncludeIndex(context);
+          includeIndex.set(context, index);
+        }
+        const hits = index.get(name);
+        if (hits && hits.length > 0) cand = hits[0]!;
+      }
+      if (!cand) return null;
+      const inFile = context.getNodesInFile(cand);
       const target = inFile.find((n) => n.kind === 'module') ?? inFile.find((n) => n.kind === 'file');
       if (target) {
         return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'framework' };

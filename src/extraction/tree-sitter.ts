@@ -6710,6 +6710,31 @@ export function extractFromSource(
     // CFML never spells one in source) stays `<anonymous>`.
     const extractor = new CfmlExtractor(filePath, source, detectedLanguage);
     result = extractor.extract();
+  } else if (detectedLanguage === 'assembly') {
+    // Assembly sources (.asm/.nasm/.s/.S): no grammar, but emit a file node
+    // (id `file:<path>`, matching TreeSitterExtractor) so INF [Sources]
+    // imports resolve to a real target — the file-level-only branch stores a
+    // file record with zero nodes, which would drop every module→assembly edge.
+    const fileNode: Node = {
+      id: `file:${filePath}`,
+      kind: 'file',
+      name: path.basename(filePath),
+      qualifiedName: filePath,
+      filePath,
+      language: 'assembly',
+      startLine: 1,
+      endLine: source.split('\n').length,
+      startColumn: 0,
+      endColumn: 0,
+      updatedAt: Date.now(),
+    };
+    result = {
+      nodes: [fileNode],
+      edges: [],
+      unresolvedReferences: [],
+      errors: [],
+      durationMs: 0,
+    };
   } else if (isFileLevelOnlyLanguage(detectedLanguage)) {
     // No symbol extraction at this stage — files are tracked at the file-record
     // level only. Framework extractors (Drupal routing yml, Spring `@Value`

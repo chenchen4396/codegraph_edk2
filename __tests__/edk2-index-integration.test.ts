@@ -165,3 +165,97 @@ describe('EDK2 full index + linkage', () => {
     }
   });
 });
+
+describe('EDK2 round-2: fragments, FLASH_DEFINITION, C headers, assembly', () => {
+  let dir: string;
+  let cg: CodeGraph;
+
+  beforeAll(async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'edk2-r2-'));
+    // descriptor fragment + nested include chain
+    fs.mkdirSync(path.join(dir, 'Platform'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'Platform/NetworkLibs.dsc.inc'),
+      '!include Platform/MoreLibs.dsc.inc\nDpcLib|NetworkPkg/Library/DxeDpcLib/DxeDpcLib.inf\n'.replace(/\n/g, '\r\n')
+    );
+    fs.writeFileSync(
+      path.join(dir, 'Platform/MoreLibs.dsc.inc'),
+      'DebugLib|MdePkg/Library/BaseDebugLibNull/BaseDebugLibNull.inf\n'
+    );
+    // platform DSC (FLASH_DEFINITION + !include) and its FDF
+    fs.writeFileSync(
+      path.join(dir, 'Platform/Platform.dsc'),
+      '[Defines]\n  PLATFORM_NAME      = TestPlatform\n  FLASH_DEFINITION   = Platform/Platform.fdf\n  !include Platform/NetworkLibs.dsc.inc\n\n[Components]\n  Platform/Drv.inf\n'.replace(/\n/g, '\r\n')
+    );
+    fs.writeFileSync(path.join(dir, 'Platform/Platform.fdf'), '[FV.FvMain]\n  INF Platform/Drv.inf\n');
+    fs.writeFileSync(path.join(dir, 'Platform/Drv.inf'), '[Defines]\n  BASE_NAME = Drv\n  MODULE_TYPE = DXE_DRIVER\n\n[Sources]\n  Drv.c\n');
+    fs.writeFileSync(path.join(dir, 'Platform/Drv.c'), '#include <Protocol/Arp.h>\n\nEFI_STATUS EFIAPI Dummy (VOID) { return 0; }\n');
+    // C include target under the default EDK2 layout
+    fs.mkdirSync(path.join(dir, 'Include/Protocol'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'Include/Protocol/Arp.h'), 'typedef struct _EFI_ARP_PROTOCOL EFI_ARP_PROTOCOL;\n');
+    // assembly source + its INF
+    fs.writeFileSync(path.join(dir, 'ResetVec.nasm'), 'BITS 64\n');
+    fs.writeFileSync(path.join(dir, 'ResetVec.inf'), '[Defines]\n  BASE_NAME = ResetVec\n  MODULE_TYPE = SEC\n\n[Sources]\n  ResetVec.nasm\n'.replace(/\n/g, '\r\n'));
+
+    cg = await CodeGraph.init(dir, { index: false });
+    await cg.indexAll();
+  });
+
+  afterAll(() => {
+    cg?.destroy();
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('resolved DSC FLASH_DEFINITION → FDF file edge', () => {
+    const dscModule = cg.queries.getNodesByName('TestPlatform').find((n) => n.kind === 'module');
+    const fdf = cg.queries.getNodesByFile('Platform/Platform.fdf').find((n) => n.kind === 'file');
+    expect(dscModule).toBeDefined();
+    expect(fdf).toBeDefined();
+    if (dscModule && fdf) {
+      const edges = cg.queries.getOutgoingEdges(dscModule.id);
+      expect(edges.some((e) => e.kind === 'imports' && e.target === fdf.id)).toBe(true);
+    }
+  });
+
+  it('resolved DSC !include → fragment file edge', () => {
+    const dscModule = cg.queries.getNodesByName('TestPlatform').find((n) => n.kind === 'module');
+    const frag = cg.queries.getNodesByFile('Platform/NetworkLibs.dsc.inc').find((n) => n.kind === 'file');
+    expect(frag).toBeDefined();
+    if (dscModule && frag) {
+      const edges = cg.queries.getOutgoingEdges(dscModule.id);
+      expect(edges.some((e) => e.kind === 'imports' && e.target === frag.id)).toBe(true);
+    }
+  });
+
+  it('resolved fragment !include chain (NetworkLibs → MoreLibs)', () => {
+    const frag = cg.queries.getNodesByFile('Platform/NetworkLibs.dsc.inc').find((n) => n.kind === 'file');
+    const more = cg.queries.getNodesByFile('Platform/MoreLibs.dsc.inc').find((n) => n.kind === 'file');
+    expect(frag).toBeDefined();
+    expect(more).toBeDefined();
+    if (frag && more) {
+      const edges = cg.queries.getOutgoingEdges(frag.id);
+      expect(edges.some((e) => e.kind === 'imports' && e.target === more.id)).toBe(true);
+    }
+  });
+
+  it('resolved C #include <Protocol/Arp.h> → Include/Protocol/Arp.h', () => {
+    const header = cg.queries.getNodesByFile('Include/Protocol/Arp.h').find((n) => n.kind === 'file');
+    expect(header).toBeDefined();
+    if (header) {
+      const edges = cg.queries.getIncomingEdges(header.id);
+      expect(edges.some((e) => e.kind === 'imports')).toBe(true);
+    }
+  });
+
+  it('indexed assembly source as an assembly file node linked from its INF', () => {
+    const asm = cg.queries.getNodesByFile('ResetVec.nasm').find((n) => n.kind === 'file');
+    expect(asm).toBeDefined();
+    expect(asm!.language).toBe('assembly');
+    const module = cg.queries.getNodesByName('ResetVec').find((n) => n.kind === 'module');
+    expect(module).toBeDefined();
+    if (module && asm) {
+      const edges = cg.queries.getOutgoingEdges(module.id);
+      expect(edges.some((e) => e.kind === 'imports' && e.target === asm.id)).toBe(true);
+    }
+  });
+});

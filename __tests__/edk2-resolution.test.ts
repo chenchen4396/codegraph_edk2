@@ -269,3 +269,95 @@ VOID F(VOID) {
     expect(references).toHaveLength(0);
   });
 });
+describe('edk2Resolver.claimsReference', () => {
+  it('claims path-shaped descriptor refs, fragments, and C headers', () => {
+    expect(edk2Resolver.claimsReference('MdePkg/MdePkg.dec')).toBe(true);
+    expect(edk2Resolver.claimsReference('NetworkPkg/NetworkLibs.dsc.inc')).toBe(true);
+    expect(edk2Resolver.claimsReference('OvmfPkg/ArmVirtRules.fdf.inc')).toBe(true);
+    expect(edk2Resolver.claimsReference('Protocol/Arp.h')).toBe(true);
+    expect(edk2Resolver.claimsReference('Uefi.h')).toBe(true);
+    // symbol-shaped names are NOT claimed — they pass the pre-filter natively
+    expect(edk2Resolver.claimsReference('PcdDebugPropertyMask')).toBe(false);
+    expect(edk2Resolver.claimsReference('gEfiArpProtocolGuid')).toBe(false);
+  });
+});
+
+describe('edk2Resolver — C include resolution', () => {
+  it('resolves angle-bracket headers via the <pkg>/Include/ layout fallback', () => {
+    const header = mkConstant('Arp.h', 'MdePkg/Include/Protocol/Arp.h', 'MdePkg/Include/Protocol/Arp.h', 1);
+    header.kind = 'file';
+    const ctx = {
+      ...baseContext(),
+      fileExists: () => false,
+      getNodesByKind: (k: string) => (k === 'file' ? [header] : []),
+      getNodesInFile: (p: string) => (p === 'MdePkg/Include/Protocol/Arp.h' ? [header] : []),
+    };
+    const ref: UnresolvedRef = {
+      fromNodeId: 'file:test/App.c',
+      referenceName: 'Protocol/Arp.h',
+      referenceKind: 'imports',
+      line: 1,
+      column: 10,
+      filePath: 'test/App.c',
+      language: 'c',
+    };
+    const result = edk2Resolver.resolve(ref, ctx as never);
+    expect(result?.targetNodeId).toBe(header.id);
+    expect(result?.resolvedBy).toBe('framework');
+    expect(result?.confidence).toBeGreaterThanOrEqual(0.9);
+  });
+
+  it('resolves a bare header name (Uefi.h) via the include index', () => {
+    const header = mkConstant('Uefi.h', 'MdePkg/Include/Uefi.h', 'MdePkg/Include/Uefi.h', 1);
+    header.kind = 'file';
+    const ctx = {
+      ...baseContext(),
+      fileExists: () => false,
+      getNodesByKind: (k: string) => (k === 'file' ? [header] : []),
+      getNodesInFile: (p: string) => (p === 'MdePkg/Include/Uefi.h' ? [header] : []),
+    };
+    const ref: UnresolvedRef = {
+      fromNodeId: 'file:test/App.c',
+      referenceName: 'Uefi.h',
+      referenceKind: 'imports',
+      line: 1,
+      column: 10,
+      filePath: 'test/App.c',
+      language: 'c',
+    };
+    const result = edk2Resolver.resolve(ref, ctx as never);
+    expect(result?.targetNodeId).toBe(header.id);
+  });
+
+  it('returns null for a header with no Include/ match (normal resolver takes over)', () => {
+    const ref: UnresolvedRef = {
+      fromNodeId: 'file:test/App.c',
+      referenceName: 'CapsuleService.h',
+      referenceKind: 'imports',
+      line: 2,
+      column: 0,
+      filePath: 'test/App.c',
+      language: 'c',
+    };
+    expect(edk2Resolver.resolve(ref, baseContext() as never)).toBeNull();
+  });
+});
+
+describe('edk2Resolver — PCD Bool/Size variants', () => {
+  it('extracts PcdGetBool and FixedPcdGetSize refs from C content', () => {
+    const src = `VOID f (VOID) {
+  BOOLEAN a = PcdGetBool (PcdIPv4PXESupport);
+  UINTN   b = FixedPcdGetSize (PcdDebugPrintErrorLevel);
+  PcdSetBoolS (gEfiNetworkPkgTokenSpaceGuid.PcdIPv6PXESupport, TRUE);
+}
+`;
+    const out = edk2Resolver.extract('Pkg/Drv/Drv.c', src);
+    const names = out.references.map((r) => r.referenceName);
+    expect(names).toContain('PcdIPv4PXESupport');
+    expect(names).toContain('PcdDebugPrintErrorLevel');
+    expect(names).toContain('PcdIPv6PXESupport');
+    const ts = out.references.find((r) => r.referenceName === 'PcdIPv6PXESupport');
+    expect(ts?.candidates).toContain('gEfiNetworkPkgTokenSpaceGuid.PcdIPv6PXESupport');
+    expect(out.references.every((r) => r.referenceKind === 'references')).toBe(true);
+  });
+});

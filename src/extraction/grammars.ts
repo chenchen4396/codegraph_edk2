@@ -11,7 +11,7 @@ import * as fsp from 'fs/promises';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
 import { Language } from '../types';
 
-export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'astro' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'edk2' | 'unknown'>;
+export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'astro' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'edk2' | 'assembly' | 'unknown'>;
 
 /**
  * WASM filename map — maps each language to its .wasm grammar file
@@ -178,6 +178,13 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.dec': 'edk2',
   '.uni': 'edk2',
   '.vfr': 'edk2',
+  // Assembly sources — tracked at the file-record level only (no grammar);
+  // EDK2 firmware carries .nasm/.asm/.S/.s in INF [Sources] and they must be
+  // indexable so INF→source imports resolve to real file nodes.
+  '.asm': 'assembly',
+  '.nasm': 'assembly',
+  '.nasmb': 'assembly',
+  '.s': 'assembly',
 };
 
 /**
@@ -493,6 +500,11 @@ export function detectLanguage(filePath: string, source?: string, overrides?: Re
   // OTP `.app`/`.app.src` resource files — Erlang terms the grammar parses as
   // top-level expressions (last-dot ext `.src` is too generic for the map).
   if (isErlangAppFile(filePath)) return 'erlang';
+  // EDK2 DSC/FDF/INF include fragments (`Platform.dsc.inc`, `Rules.fdf.inc`):
+  // the last-dot ext is `.inc` (too generic for EXTENSION_MAP), but the
+  // multi-dot suffix is descriptor syntax spliced into platform files via
+  // `!include` — route them to the Edk2Extractor's fragment parser.
+  if (/\.(?:dsc|fdf|inf)\.inc$/i.test(filePath)) return 'edk2';
   const lang = (overrides && overrides[ext]) || EXTENSION_MAP[ext] || 'unknown';
 
   // .h files could be C, C++, or Objective-C — check source content
@@ -545,6 +557,7 @@ export function isLanguageSupported(language: Language): boolean {
   if (language === 'xml') return true; // MyBatis mapper extractor
   if (language === 'properties') return true; // Spring config keys
   if (language === 'edk2') return true; // custom Edk2Extractor (INF/DSC/FDF/DEC/UNI/VFR)
+  if (language === 'assembly') return true; // file-level tracking only
   if (language === 'unknown') return false;
   return language in WASM_GRAMMAR_FILES;
 }
@@ -555,7 +568,7 @@ export function isLanguageSupported(language: Language): boolean {
 export function isGrammarLoaded(language: Language): boolean {
   if (language === 'svelte' || language === 'vue' || language === 'astro' || language === 'liquid' || language === 'razor') return true;
   if (language === 'yaml' || language === 'twig') return true; // no WASM grammar needed
-  if (language === 'xml' || language === 'properties' || language === 'edk2') return true; // no WASM grammar needed
+  if (language === 'xml' || language === 'properties' || language === 'edk2' || language === 'assembly') return true; // no WASM grammar needed
   return languageCache.has(language);
 }
 
@@ -665,6 +678,7 @@ export function getLanguageDisplayName(language: Language): string {
     terraform: 'Terraform',
     arkts: 'ArkTS',
     edk2: 'EDK2',
+    assembly: 'Assembly',
     unknown: 'Unknown',
   };
   return names[language] || language;

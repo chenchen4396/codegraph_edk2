@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { extractFromSource } from '../src/extraction/tree-sitter';
+import { detectLanguage } from '../src/extraction/grammars';
 
 // Edk2Extractor — custom (no tree-sitter grammar) extraction of EDK2 / UEFI
 // descriptor files. Each extension asserts: a file node + module/constant
@@ -300,5 +301,135 @@ describe('Edk2Extractor — VFR', () => {
     result.unresolvedReferences.forEach((r) => {
       expect(r.referenceKind).toBe('references');
     });
+  });
+});
+describe('Edk2Extractor — .inc fragments', () => {
+  it('routes *.dsc.inc / *.fdf.inc through detectLanguage to edk2', () => {
+    expect(detectLanguage('NetworkPkg/NetworkLibs.dsc.inc')).toBe('edk2');
+    expect(detectLanguage('OvmfPkg/ArmVirtRules.fdf.inc')).toBe('edk2');
+    expect(detectLanguage('NetworkPkg/Network.fdf.inc')).toBe('edk2');
+    // plain .inc stays out of the edk2 path (php include / asm fragments)
+    expect(detectLanguage('OvmfPkg/Include/TdxCommondefs.inc')).not.toBe('edk2');
+  });
+
+  it('parses section-less dsc.inc content (!include + lib instance + PCD)', () => {
+    const src = `## @file
+# Network DSC include.
+##
+!include NetworkPkg/NetworkDefines.dsc.inc
+
+  DpcLib|NetworkPkg/Library/DxeDpcLib/DxeDpcLib.inf
+  gEfiNetworkPkgTokenSpaceGuid.PcdIPv4PXESupport|0x01
+`;
+    const result = extractFromSource('NetworkPkg/NetworkLibs.dsc.inc', CRLF(src), 'edk2');
+    const names = result.unresolvedReferences.map((r) => r.referenceName);
+    expect(names).toContain('NetworkPkg/NetworkDefines.dsc.inc');
+    expect(names).toContain('NetworkPkg/Library/DxeDpcLib/DxeDpcLib.inf');
+    const pcd = result.unresolvedReferences.find((r) => r.referenceName === 'PcdIPv4PXESupport');
+    expect(pcd).toBeDefined();
+    expect(pcd!.candidates).toContain('gEfiNetworkPkgTokenSpaceGuid.PcdIPv4PXESupport');
+    expect(pcd!.referenceKind).toBe('references');
+    // fragments have no identity — file node only
+    expect(result.nodes).toHaveLength(1);
+    expect(result.nodes[0]!.kind).toBe('file');
+  });
+
+  it('parses fdf.inc INF lines and !include', () => {
+    const src = `!include OvmfPkg/Include/Fdf/ShellDxe.fdf.inc
+  INF NetworkPkg/DpcDxe/DpcDxe.inf
+`;
+    const result = extractFromSource('NetworkPkg/Network.fdf.inc', CRLF(src), 'edk2');
+    const names = result.unresolvedReferences.map((r) => r.referenceName);
+    expect(names).toContain('OvmfPkg/Include/Fdf/ShellDxe.fdf.inc');
+    expect(names).toContain('NetworkPkg/DpcDxe/DpcDxe.inf');
+    expect(result.unresolvedReferences.every((r) => r.referenceKind === 'imports')).toBe(true);
+  });
+
+  it('degrades a pure build-flag fragment to a file node only', () => {
+    const src = `!if $(NETWORK_ISCSI_ENABLE) == TRUE
+  MSFT:*_*_*_CC_FLAGS = /D ENABLE_MD5_DEPRECATED_INTERFACES
+  GCC:*_*_*_CC_FLAGS = -D ENABLE_MD5_DEPRECATED_INTERFACES
+!endif
+`;
+    const result = extractFromSource('NetworkPkg/NetworkBuildOptions.dsc.inc', CRLF(src), 'edk2');
+    expect(result.nodes).toHaveLength(1);
+    expect(result.nodes[0]!.kind).toBe('file');
+    expect(result.unresolvedReferences).toHaveLength(0);
+  });
+});
+
+describe('Edk2Extractor — DSC !include / FLASH_DEFINITION / component blocks', () => {
+  it('emits the FLASH_DEFINITION FDF as an imports ref', () => {
+    const src = `[Defines]
+  PLATFORM_NAME      = Ovmf
+  FLASH_DEFINITION   = OvmfPkg/OvmfPkgX64.fdf
+
+[Components]
+  OvmfPkg/PlatformDxe/PlatformDxe.inf
+`;
+    const result = extractFromSource('OvmfPkg/OvmfPkgX64.dsc', CRLF(src), 'edk2');
+    const flash = result.unresolvedReferences.find(
+      (r) => r.referenceName === 'OvmfPkg/OvmfPkgX64.fdf'
+    );
+    expect(flash).toBeDefined();
+    expect(flash!.referenceKind).toBe('imports');
+  });
+
+  it('emits !include refs from a DSC via the raw-line scan', () => {
+    const src = `[Defines]
+  PLATFORM_NAME = Ovmf
+!include OvmfPkg/OvmfPkgDefines.dsc.inc
+
+[Components]
+  NetworkPkg/ArpDxe/ArpDxe.inf
+`;
+    const result = extractFromSource('OvmfPkg/OvmfPkgX64.dsc', CRLF(src), 'edk2');
+    const names = result.unresolvedReferences.map((r) => r.referenceName);
+    expect(names).toContain('OvmfPkg/OvmfPkgDefines.dsc.inc');
+  });
+
+  it('parses [Components] override blocks (LibraryClasses + Pcds)', () => {
+    const src = `[Defines]
+  PLATFORM_NAME = Ovmf
+
+[Components]
+  UefiCpuPkg/CpuDxe/CpuDxe.inf {
+    <LibraryClasses>
+      MpInitLib|UefiCpuPkg/Library/MpInitLib/DxeMpInitLib.inf
+      NULL|OvmfPkg/Library/MpInitLibDepLib/DxeMpInitLibMpDepLib.inf
+    <PcdsFixedAtBuild>
+      gEfiMdeModulePkgTokenSpaceGuid.PcdDxeNxMemoryProtectionPolicy|0x1
+  }
+  NetworkPkg/ArpDxe/ArpDxe.inf
+`;
+    const result = extractFromSource('OvmfPkg/OvmfPkgX64.dsc', CRLF(src), 'edk2');
+    const names = result.unresolvedReferences.map((r) => r.referenceName);
+    expect(names).toContain('UefiCpuPkg/CpuDxe/CpuDxe.inf');
+    expect(names).toContain('UefiCpuPkg/Library/MpInitLib/DxeMpInitLib.inf');
+    expect(names).toContain('OvmfPkg/Library/MpInitLibDepLib/DxeMpInitLibMpDepLib.inf');
+    expect(names).toContain('NetworkPkg/ArpDxe/ArpDxe.inf');
+    const pcd = result.unresolvedReferences.find(
+      (r) => r.referenceName === 'PcdDxeNxMemoryProtectionPolicy'
+    );
+    expect(pcd).toBeDefined();
+    expect(pcd!.candidates).toContain('gEfiMdeModulePkgTokenSpaceGuid.PcdDxeNxMemoryProtectionPolicy');
+  });
+});
+
+describe('Edk2Extractor — INF [Sources] imports', () => {
+  it('emits imports to every [Sources] entry (C + assembly)', () => {
+    const src = `[Defines]
+  BASE_NAME    = ResetVector
+  MODULE_TYPE  = SEC
+
+[Sources]
+  ResetVector.nasm
+  Main.c
+`;
+    const result = extractFromSource('OvmfPkg/ResetVector/ResetVector.inf', CRLF(src), 'edk2');
+    const names = result.unresolvedReferences.map((r) => r.referenceName);
+    expect(names).toContain('OvmfPkg/ResetVector/ResetVector.nasm');
+    expect(names).toContain('OvmfPkg/ResetVector/Main.c');
+    expect(result.unresolvedReferences.every((r) => r.referenceKind === 'imports')).toBe(true);
   });
 });

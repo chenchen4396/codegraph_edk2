@@ -72,6 +72,11 @@ export class Edk2Extractor {
         case '.vfr':
           this.parseVfr();
           break;
+        case '.inc':
+          // EDK2 !include fragment (`*.dsc.inc` / `*.fdf.inc` / `*.inf.inc`) —
+          // section-less descriptor content spliced into a host file.
+          this.parseFragment();
+          break;
         default:
           break;
       }
@@ -217,6 +222,7 @@ export class Edk2Extractor {
     const sections = Edk2Extractor.splitSections(this.source);
     const defines = new Map<string, string>();
     const sources: string[] = []; // project-relative .c/.cc source paths
+    const sourceFiles: { rel: string; line: number }[] = []; // every [Sources] entry
     let moduleLine = 1;
 
     for (const sec of sections) {
@@ -226,9 +232,10 @@ export class Edk2Extractor {
           if (m) defines.set(m[1]!, m[2]!.trim());
         }
       } else if (sec.name === 'Sources') {
-        for (const { text } of sec.lines) {
+        for (const { text, line } of sec.lines) {
           const sp = text.split(/\s+/)[0]!;
           if (/\.(c|cc|cpp)$/i.test(sp)) sources.push(this.rel(sp));
+          if (/\.(c|cc|cpp|asm|nasm|s)$/i.test(sp)) sourceFiles.push({ rel: this.rel(sp), line });
         }
       }
     }
@@ -319,6 +326,13 @@ export class Edk2Extractor {
         default:
           break;
       }
+    }
+
+    // Module → every [Sources] file (C + assembly). The C entries also scope
+    // the ENTRY_POINT lookup below; assembly entries have no function nodes so
+    // this import is their only module hook.
+    for (const { rel, line } of sourceFiles) {
+      this.emitRef(from, rel, 'imports', line);
     }
 
     // ENTRY_POINT / UNLOAD_IMAGE / CONSTRUCTOR → C function (candidates = the
@@ -445,11 +459,17 @@ export class Edk2Extractor {
   private parseDsc(): void {
     const sections = Edk2Extractor.splitSections(this.source);
     const defines = new Map<string, string>();
+    let flashDef: { value: string; line: number } | null = null;
     for (const sec of sections) {
       if (sec.name !== 'Defines') continue;
-      for (const { text } of sec.lines) {
+      for (const { text, line } of sec.lines) {
         const m = text.match(/^([A-Za-z0-9_]+)\s*=\s*(.*)$/);
-        if (m) defines.set(m[1]!, m[2]!.trim());
+        if (m) {
+          defines.set(m[1]!, m[2]!.trim());
+          if (m[1] === 'FLASH_DEFINITION' && m[2]!.trim().endsWith('.fdf')) {
+            flashDef = { value: m[2]!.trim(), line };
+          }
+        }
       }
     }
     const platform = defines.get('PLATFORM_NAME');
@@ -494,10 +514,44 @@ export class Edk2Extractor {
           break;
         }
         case 'Components': {
-          // Path.inf optionally followed by `{ … }` override block. `}` closes.
+          // Path.inf optionally followed by `{ … }` override block containing
+          // `<LibraryClasses>` / `<Pcds*>` pseudo-sections — component-scoped
+          // library instances and PCD assignments (real: 378 `<LibraryClasses>`
+          // in the tianocore corpus).
+          let inBlock = false;
+          let blockSection: string | null = null;
           for (const { text, line } of sec.lines) {
+            if (inBlock) {
+              if (/^}\s*$/.test(text)) {
+                inBlock = false;
+                blockSection = null;
+                continue;
+              }
+              const hdr = text.match(/^<([^>]+)>$/);
+              if (hdr) {
+                blockSection = hdr[1]!.replace(/\.[A-Za-z0-9_]+$/, ''); // strip .ARCH
+                continue;
+              }
+              if (blockSection === 'LibraryClasses') {
+                const lc = text.match(/^([A-Za-z0-9_]+)\s*\|\s*(\S+\.inf)/);
+                if (lc) {
+                  this.emitRef(from, lc[2]!, 'imports', line);
+                  continue;
+                }
+              } else if (blockSection && blockSection.startsWith('Pcds')) {
+                const pcd = text.match(/^([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)\s*\|/);
+                if (pcd) {
+                  this.emitRef(from, pcd[2]!, 'references', line, [pcd[1]! + '.' + pcd[2]!]);
+                  continue;
+                }
+              }
+              continue; // <Defines>/<BuildOptions>/bare lines → no link target
+            }
             const m = text.match(/^(\S+\.inf)/);
-            if (m) this.emitRef(from, m[1]!, 'imports', line);
+            if (m) {
+              this.emitRef(from, m[1]!, 'imports', line);
+              if (text.includes('{')) inBlock = true;
+            }
           }
           break;
         }
@@ -512,6 +566,16 @@ export class Edk2Extractor {
           break;
       }
     }
+
+    // `!include` lines — splitSections' `!` skip drops them, so scan raw lines.
+    const rawLines = this.source.split('\n');
+    for (let i = 0; i < rawLines.length; i++) {
+      const inc = rawLines[i]!.match(/^\s*!include\s+(\S+)/);
+      if (inc) this.emitRef(from, inc[1]!, 'imports', i + 1);
+    }
+    // The platform's flash layout file — the DSC→FDF link that makes
+    // dead-FDF detection possible (an FDF with no incoming edges is unused).
+    if (flashDef) this.emitRef(from, flashDef.value, 'imports', flashDef.line);
   }
 
   // --------------------------------------------------------------------------
@@ -521,8 +585,58 @@ export class Edk2Extractor {
     const lines = this.source.split('\n');
     const re = /^\s*INF\s+(?:RuleOverride=\S+\s+)?(\S+\.inf)\s*$/i;
     for (let i = 0; i < lines.length; i++) {
-      const m = lines[i]!.match(re);
+      const line = lines[i]!;
+      const inc = line.match(/^\s*!include\s+(\S+)/);
+      if (inc) {
+        this.emitRef(this.fileNodeId, inc[1]!, 'imports', i + 1);
+        continue;
+      }
+      const m = line.match(re);
       if (m) this.emitRef(this.fileNodeId, m[1]!, 'imports', i + 1);
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Fragments (`*.dsc.inc` / `*.fdf.inc` / `*.inf.inc`): section-less content
+  // spliced into a host file's section context via `!include`. No section
+  // headers required — scan every line for the four linkage patterns. Pure
+  // build-flag fragments (e.g. NetworkBuildOptions.dsc.inc) match none and
+  // degrade to a file node only.
+  // --------------------------------------------------------------------------
+  private parseFragment(): void {
+    const lines = this.source.split('\n');
+    const includeRe = /^\s*!include\s+(\S+)/;
+    const libClassRe = /^([A-Za-z0-9_]+)\s*\|\s*(\S+\.inf)/;
+    const pcdRe = /^\s*(?:([A-Za-z0-9_]+)\.)?(Pcd[A-Za-z0-9_]+)\s*\|/;
+    const infRe = /^\s*INF\s+(?:RuleOverride=\S+\s+)?(\S+\.inf)\s*$/i;
+    for (let i = 0; i < lines.length; i++) {
+      const text = lines[i]!.trim();
+      const line = i + 1;
+      const inc = text.match(includeRe);
+      if (inc) {
+        this.emitRef(this.fileNodeId, inc[1]!, 'imports', line);
+        continue;
+      }
+      if (text === '' || text.startsWith('#') || text.startsWith('//') || text.startsWith('!')) {
+        // `!if/!endif` etc. are skipped — both branches are scanned regardless
+        // (over-linking is harmless, splitSections precedent).
+        continue;
+      }
+      const lc = text.match(libClassRe);
+      if (lc) {
+        this.emitRef(this.fileNodeId, lc[2]!, 'imports', line);
+        continue;
+      }
+      const pcd = text.match(pcdRe);
+      if (pcd) {
+        const full = pcd[1] ? pcd[1]! + '.' + pcd[2]! : pcd[2]!;
+        this.emitRef(this.fileNodeId, pcd[2]!, 'references', line, [full]);
+        continue;
+      }
+      const inf = text.match(infRe);
+      if (inf) {
+        this.emitRef(this.fileNodeId, inf[1]!, 'imports', line);
+      }
     }
   }
 
