@@ -471,24 +471,89 @@ describe('edk2Resolver — Round 3 audit fixes', () => {
     expect(result?.targetNodeId).toBe(local.id);
   });
 
-  it('expands $(FSP_PACKAGE)/… macro paths before resolving', () => {
-    const target = mkModuleNode('IntelFsp2Pkg/Core/X.inf', 1, 'X');
+  it('expands $(WORKSPACE)/ and $(EDK_TOOLS_PATH)/ macro paths before resolving', () => {
+    // WORKSPACE is the project root; EDK_TOOLS_PATH the BaseTools tree — the
+    // only macro expansions that are platform-invariant (vendor macros like
+    // FSP_PACKAGE are DEFINE'd per-platform and expanded extractor-side).
+    const target = mkModuleNode('MdeModulePkg/Core/X.inf', 1, 'X');
     const ctx = {
       ...baseContext(),
-      fileExists: (p: string) => p === 'IntelFsp2Pkg/Core/X.inf',
-      getNodesInFile: (p: string) => (p === 'IntelFsp2Pkg/Core/X.inf' ? [target] : []),
+      fileExists: (p: string) => p === 'MdeModulePkg/Core/X.inf' || p === 'BaseTools/Source/C/X.inf',
+      getNodesInFile: (p: string) =>
+        p === 'MdeModulePkg/Core/X.inf' || p === 'BaseTools/Source/C/X.inf' ? [target] : [],
     };
-    const ref: UnresolvedRef = {
+    const refWs: UnresolvedRef = {
       fromNodeId: 'file:Test.dsc',
-      referenceName: '$(FSP_PACKAGE)/Core/X.inf',
+      referenceName: '$(WORKSPACE)/MdeModulePkg/Core/X.inf',
       referenceKind: 'imports',
       line: 1,
       column: 0,
       filePath: 'Test.dsc',
       language: 'edk2',
     };
+    expect(edk2Resolver.resolve(refWs, ctx as never)?.targetNodeId).toBe(target.id);
+    const refEtp: UnresolvedRef = {
+      fromNodeId: 'file:Test.dsc',
+      referenceName: '$(EDK_TOOLS_PATH)/Source/C/X.inf',
+      referenceKind: 'imports',
+      line: 1,
+      column: 0,
+      filePath: 'Test.dsc',
+      language: 'edk2',
+    };
+    expect(edk2Resolver.resolve(refEtp, ctx as never)?.targetNodeId).toBe(target.id);
+  });
+
+  it('does NOT expand vendor macros ($(FSP_PACKAGE)) with a hardcoded package', () => {
+    // A platform that overrides `DEFINE FSP_PACKAGE = <its own package>` must
+    // not be linked to IntelFsp2Pkg — the resolver has no business knowing
+    // vendor defaults. The ref stays verbatim and dies on fileExists.
+    const ctx = {
+      ...baseContext(),
+      fileExists: (p: string) => p === 'IntelFsp2Pkg/Core/X.inf',
+      getNodesInFile: (p: string) => (p === 'IntelFsp2Pkg/Core/X.inf' ? [mkModuleNode('IntelFsp2Pkg/Core/X.inf', 1, 'X')] : []),
+    };
+    const ref: UnresolvedRef = {
+      fromNodeId: 'file:Platform.dsc',
+      referenceName: '$(FSP_PACKAGE)/Core/X.inf',
+      referenceKind: 'imports',
+      line: 1,
+      column: 0,
+      filePath: 'Platform.dsc',
+      language: 'edk2',
+    };
+    expect(edk2Resolver.resolve(ref, ctx as never)).toBeNull();
+  });
+
+  it('resolves headers under DEC-declared [Includes] dirs outside the default layout', () => {
+    // SecurityPkg's libspdm style: `[Includes] = Library/SpdmLib/libspdm/include`
+    // — the `/Include/` path heuristic can't see it, the DEC declaration can.
+    const header = mkModuleNode('SecurityPkg/Library/SpdmLib/libspdm/include/library/spdm_lib_config.h', 1, 'spdm_lib_config');
+    header.kind = 'file' as Node['kind'];
+    const dec = mkModuleNode('SecurityPkg/SecurityPkg.dec', 1, 'SecurityPkg');
+    const ctx = {
+      ...baseContext(),
+      getNodesByKind: (k: string) => {
+        if (k === 'file') return [header];
+        if (k === 'module') return [dec];
+        return [];
+      },
+      getNodesInFile: (p: string) => (p === header.filePath ? [header] : []),
+      readFile: (p: string) => (p === 'SecurityPkg/SecurityPkg.dec'
+        ? '[Defines]\n  PACKAGE_NAME = SecurityPkg\n\n[Includes]\n  Include\n  Library/SpdmLib/libspdm/include\n'
+        : null),
+    };
+    const ref: UnresolvedRef = {
+      fromNodeId: 'file:SecurityPkg/Drv.c',
+      referenceName: 'library/spdm_lib_config.h',
+      referenceKind: 'imports',
+      line: 1,
+      column: 10,
+      filePath: 'SecurityPkg/Drv.c',
+      language: 'c',
+    };
     const result = edk2Resolver.resolve(ref, ctx as never);
-    expect(result?.targetNodeId).toBe(target.id);
+    expect(result?.targetNodeId).toBe(header.id);
   });
 });
 

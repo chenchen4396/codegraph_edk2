@@ -6753,13 +6753,15 @@ export function extractFromSource(
       endColumn: 0,
       updatedAt: Date.now(),
     };
-    // NASM `%include "fragment.nasm.inc"` — link the macro fragment (indexed
-    // as an assembly file node) to its includer. Paths are relative to the
-    // including file (corpus: `Ia32/Flat32ToFlat64.nasm.inc` from ResetVector);
-    // the edk2 resolver resolves the dir-joined path via fileExists.
+    // NASM `%include "fragment.nasm.inc"` and GNU-as `#include "AsmMacroIoLib.inc"`
+    // (ARM/RISC-V .S sources) — link the macro fragment (indexed as an
+    // assembly file node) to its includer. Paths are relative to the including
+    // file (corpus: `Ia32/Flat32ToFlat64.nasm.inc` from ResetVector, ARM
+    // `#include "AsmMacroIoLib.inc"`); the edk2 resolver resolves the
+    // dir-joined path via fileExists.
     const dir = path.dirname(filePath) === '.' ? '' : path.dirname(filePath);
     const unresolvedReferences: UnresolvedReference[] = [];
-    const includeRe = /^\s*%include\s+["<]([^">]+)[">]/gm;
+    const includeRe = /^\s*#?%?include\s+["<]([^">]+)[">]/gm;
     let incM: RegExpExecArray | null;
     while ((incM = includeRe.exec(source)) !== null) {
       const target = dir

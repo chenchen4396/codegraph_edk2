@@ -324,12 +324,15 @@ export function buildDefaultIgnore(rootDir: string): Ignore {
   return ig;
 }
 
-/** EDK2 workspace detection: `BaseTools/` + an `edksetup` script at the root
- * (the layout every TianoCore checkout has, and nothing else commonly does). */
+/** EDK2 workspace detection: `BaseTools/` + the canonical build-tool source
+ * dir `BaseTools/Source/Python/build/` (present in every EDK2 derivative —
+ * tianocore, Project Mu, vendor forks — whether or not it carries the
+ * `edksetup` scripts at the root). */
 function isEdk2Workspace(rootDir: string): boolean {
   return (
     fs.existsSync(path.join(rootDir, 'BaseTools')) &&
-    (fs.existsSync(path.join(rootDir, 'edksetup.sh')) ||
+    (fs.existsSync(path.join(rootDir, 'BaseTools', 'Source', 'Python', 'build')) ||
+      fs.existsSync(path.join(rootDir, 'edksetup.sh')) ||
       fs.existsSync(path.join(rootDir, 'edksetup.bat')))
   );
 }

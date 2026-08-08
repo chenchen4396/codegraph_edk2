@@ -6954,10 +6954,10 @@ describe('Directory Exclusion', () => {
     // silently drop it — and so would the tree's own `Build/` output rule,
     // because the ignore matcher is case-insensitive. The EDK2 carve-out
     // negates the defaults for BaseTools/ when the workspace markers are
-    // present.
+    // present — here detected via the build-tool source dir alone (no
+    // edksetup script, the Project Mu / vendor-fork shape).
     fs.mkdirSync(path.join(tempDir, 'BaseTools', 'Source', 'Python', 'build'), { recursive: true });
     fs.writeFileSync(path.join(tempDir, 'BaseTools', 'Source', 'Python', 'build', 'build.py'), 'print("build tool")\n');
-    fs.writeFileSync(path.join(tempDir, 'edksetup.sh'), '#!/bin/sh\n');
     // The real edk2 .gitignore ignores its BUILD OUTPUT dir with `Build/` —
     // the case-insensitive matcher would otherwise swallow the lowercase
     // source dir too.

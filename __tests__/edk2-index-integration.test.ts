@@ -197,6 +197,10 @@ describe('EDK2 round-2: fragments, FLASH_DEFINITION, C headers, assembly', () =>
     fs.writeFileSync(path.join(dir, 'CommonMacros.nasm.inc'), '%define FIXED_VECTOR 0x10\n');
     fs.writeFileSync(path.join(dir, 'ResetVec.nasm'), 'BITS 64\n%include "CommonMacros.nasm.inc"\n');
     fs.writeFileSync(path.join(dir, 'ResetVec.inf'), '[Defines]\n  BASE_NAME = ResetVec\n  MODULE_TYPE = SEC\n\n[Sources]\n  ResetVec.nasm\n'.replace(/\n/g, '\r\n'));
+    // GNU-as ARM style: `#include "AsmMacroIoLib.inc"` (no % prefix)
+    fs.writeFileSync(path.join(dir, 'AsmMacroIoLib.inc'), 'MACRO\n  MyMacro\nENDM\n');
+    fs.writeFileSync(path.join(dir, 'ArmBoot.S'), '#include "AsmMacroIoLib.inc"\n.section .text\n');
+    fs.writeFileSync(path.join(dir, 'ArmBoot.inf'), '[Defines]\n  BASE_NAME = ArmBoot\n  MODULE_TYPE = SEC\n\n[Sources]\n  ArmBoot.S\n'.replace(/\n/g, '\r\n'));
 
     cg = await CodeGraph.init(dir, { index: false });
     await cg.indexAll();
@@ -263,6 +267,19 @@ describe('EDK2 round-2: fragments, FLASH_DEFINITION, C headers, assembly', () =>
   it('resolved NASM %include → fragment file edge', () => {
     const asm = cg.queries.getNodesByFile('ResetVec.nasm').find((n) => n.kind === 'file');
     const inc = cg.queries.getNodesByFile('CommonMacros.nasm.inc').find((n) => n.kind === 'file');
+    expect(asm).toBeDefined();
+    expect(inc).toBeDefined();
+    if (asm && inc) {
+      const edges = cg.queries.getOutgoingEdges(asm.id);
+      expect(edges.some((e) => e.kind === 'imports' && e.target === inc.id)).toBe(true);
+    }
+  });
+
+  it('resolved GNU-as #include in .S → fragment file edge', () => {
+    // ARM/RISC-V EDK2 assembly uses C-preprocessor `#include "AsmMacroIoLib.inc"`
+    // — the assembly branch must link it like NASM's %include.
+    const asm = cg.queries.getNodesByFile('ArmBoot.S').find((n) => n.kind === 'file');
+    const inc = cg.queries.getNodesByFile('AsmMacroIoLib.inc').find((n) => n.kind === 'file');
     expect(asm).toBeDefined();
     expect(inc).toBeDefined();
     if (asm && inc) {

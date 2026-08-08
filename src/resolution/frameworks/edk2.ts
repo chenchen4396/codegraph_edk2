@@ -75,15 +75,55 @@ const SOURCE_EXT = /\.(c|cc|cpp)$/i;
 const includeIndex = new WeakMap<ResolutionContext, Map<string, string[]>>();
 function buildIncludeIndex(context: ResolutionContext): Map<string, string[]> {
   const index = new Map<string, string[]>();
+  const add = (key: string, filePath: string) => {
+    const arr = index.get(key);
+    if (arr) arr.push(filePath);
+    else index.set(key, [filePath]);
+  };
+  const allFiles = new Set<string>();
   for (const n of context.getNodesByKind('file')) {
     // BaseTools/Source/C/Include vendored build-tool headers shadow the MdePkg
     // canon for names like `Protocol/DevicePath.h` — never let them win.
     if (n.filePath.startsWith('BaseTools/')) continue;
+    allFiles.add(n.filePath);
     const m = /\/Include\/(.+)$/.exec(n.filePath);
-    if (m) {
-      const arr = index.get(m[1]!);
-      if (arr) arr.push(n.filePath);
-      else index.set(m[1]!, [n.filePath]);
+    if (m) add(m[1]!, n.filePath);
+  }
+  // DEC `[Includes]` declarations are the authoritative include dirs — a
+  // package may declare dirs OUTSIDE the default `Include/` layout
+  // (SecurityPkg's libspdm, MdePkg's MipiSysTLib, …). Parse each DEC's
+  // `[Includes…]` section and map every indexed file under a declared dir by
+  // its dir-relative name. Declared dirs are package-relative (relative to
+  // the DEC file's own directory).
+  const decDirs = new Set<string>();
+  for (const n of context.getNodesByKind('module')) {
+    if (n.language !== 'edk2' || !n.filePath.endsWith('.dec')) continue;
+    const content = context.readFile(n.filePath);
+    if (!content) continue;
+    const decDir = path.posix.dirname(n.filePath);
+    let inIncludes = false;
+    for (const raw of content.split('\n')) {
+      const line = raw.trim();
+      if (/^\[[^\]]+\]$/.test(line)) {
+        inIncludes = /^\[includes/i.test(line);
+        continue;
+      }
+      if (!inIncludes || line === '' || line.startsWith('#')) continue;
+      const dir = line.split(/\s+/)[0]!.trim();
+      if (dir && !dir.startsWith('!')) {
+        decDirs.add(decDir === '.' ? dir : path.posix.join(decDir, dir));
+      }
+    }
+  }
+  if (decDirs.size > 0) {
+    const dirs = [...decDirs].sort((a, b) => b.length - a.length); // longest first
+    for (const filePath of allFiles) {
+      for (const dir of dirs) {
+        if (filePath.startsWith(dir + '/')) {
+          add(filePath.slice(dir.length + 1), filePath);
+          break;
+        }
+      }
     }
   }
   return index;
@@ -140,12 +180,15 @@ export const edk2Resolver: FrameworkResolver = {
     // `[Includes]` dir); quoted includes resolve via the normal import resolver
     // (root-relative fileExists fails here → null → no duplicate edge).
     if (DESCRIPTOR_EXT.test(name) || name.includes('/') || name.endsWith('.h')) {
-      // `$(FSP_PACKAGE)/…` / `$(PLATFORM_PACKAGE)/…` workspace macros (DSC
-      // components, FDF INF lines) — expand the two EDK2-known ones.
-      const expanded = name.replace(
-        /^\$\((FSP_PACKAGE|PLATFORM_PACKAGE)\)\//,
-        (_, k: string) => (k === 'FSP_PACKAGE' ? 'IntelFsp2Pkg/' : 'PrmPkg/')
-      );
+      // `$(WORKSPACE)/…` / `$(EDK_TOOLS_PATH)/…` — workspace-level EDK2 build
+      // macros, universal across platforms: WORKSPACE is the project root,
+      // EDK_TOOLS_PATH the BaseTools tree. (Vendor macros like
+      // `$(FSP_PACKAGE)` are platform-DEFINE'd and expanded extractor-side
+      // from the file's own [Defines]; a hardcoded mapping here would point
+      // at the wrong package on any platform that overrides them.)
+      const expanded = name
+        .replace(/^\$\(WORKSPACE\)\//, '')
+        .replace(/^\$\(EDK_TOOLS_PATH\)\//, 'BaseTools/');
       let cand = context.fileExists(expanded) ? expanded : null;
       if (!cand && name.endsWith('.h')) {
         // `<pkg>/Include/<name>` layout fallback (see buildIncludeIndex).
