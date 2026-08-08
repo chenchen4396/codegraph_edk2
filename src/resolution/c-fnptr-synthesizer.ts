@@ -934,7 +934,11 @@ export async function cFnPointerDispatchEdges(
     for (const rawItem of items) {
       const item = rawItem.trim();
       if (!item) continue;
-      const des = item.match(/^\.\s*(\w+)\s*=\s*(?:&\s*)?(\w+)\s*$/);
+      // Cast-wrapped entries: EDK2 registers service tables with an explicit
+      // prototype cast — `(EFI_ALLOCATE_PAGES)CoreAllocatePages` (DxeMain's
+      // mBootServices). Peel `(cast)` like registerArrayValue does, in both
+      // the designated and the positional branch.
+      const des = item.replace(/^\((?:[\w\s*]+)\)\s*/, '').match(/^\.\s*(\w+)\s*=\s*(?:&\s*)?(\w+)\s*$/);
       if (des) {
         const field = des[1]!;
         if (fnPtrFieldOf(struct, field)) {
@@ -946,7 +950,8 @@ export async function cFnPointerDispatchEdges(
       }
       const field = layout.find((f) => f.index === pos);
       if (field?.isFnPtr) {
-        const id = item.match(/^&?\s*(\w+)\s*$/);
+        const peeled = item.replace(/^\((?:[\w\s*]+)\)\s*/, '').replace(/^&\s*/, '');
+        const id = peeled.match(/^(\w+)$/);
         if (id) {
           const fn = resolveFn(id[1]!, file);
           if (fn) addReg(struct, field.name, fn);

@@ -491,3 +491,76 @@ describe('edk2Resolver — Round 3 audit fixes', () => {
     expect(result?.targetNodeId).toBe(target.id);
   });
 });
+
+describe('edk2Resolver — Round 4: EDK2-architecture audit fixes', () => {
+  it('synthesizes a FeaturePcdGet reference (BOOLEAN feature PCD)', () => {
+    // `FeaturePcdGet(PcdNetworkIp4Protocol)` gates network features; the
+    // accessor must not be shadowed by the `Pcd` alternative inside it.
+    const src = `#include <Uefi.h>
+EFI_STATUS F (VOID) {
+  if (FeaturePcdGet (PcdNetworkIp4Protocol)) {
+    return EFI_SUCCESS;
+  }
+  return EFI_UNSUPPORTED;
+}`;
+    const { references } = edk2Resolver.extract!('NetworkPkg/Foo.c', src)!;
+    const pcd = references.find((r) => r.referenceName === 'PcdNetworkIp4Protocol');
+    expect(pcd).toBeDefined();
+    expect(pcd!.referenceKind).toBe('references');
+  });
+
+  it('synthesizes a vendor-GUID reference (non-gEfi/gEdkii prefix)', () => {
+    // gAcpiTableHobGuid, gZeroGuid, gAmiXxxProtocolGuid … are declared in DEC
+    // [Guids] but were invisible to the gEfi|gEdkii-only usage regex.
+    const src = `#include <PiDxe.h>
+EFI_GUID *GetHob (VOID) {
+  return GetFirstGuidHob (&gAcpiTableHobGuid);
+}`;
+    const { references } = edk2Resolver.extract!('MdeModulePkg/Foo.c', src)!;
+    const guid = references.find((r) => r.referenceName === 'gAcpiTableHobGuid');
+    expect(guid).toBeDefined();
+    expect(guid!.referenceKind).toBe('references');
+  });
+
+  it('resolves a vendor-GUID ref to its DEC constant by simple name', () => {
+    const guid = mkConstant('gAcpiTableHobGuid', 'MdeModulePkg/MdeModulePkg.dec::gAcpiTableHobGuid', 'MdeModulePkg/MdeModulePkg.dec', 12);
+    const ctx = {
+      ...baseContext(),
+      getNodesByName: (n: string) => (n === 'gAcpiTableHobGuid' ? [guid] : []),
+    };
+    const ref: UnresolvedRef = {
+      fromNodeId: 'file:MdeModulePkg/Foo.c',
+      referenceName: 'gAcpiTableHobGuid',
+      referenceKind: 'references',
+      line: 3,
+      column: 30,
+      filePath: 'MdeModulePkg/Foo.c',
+      language: 'c',
+    };
+    const result = edk2Resolver.resolve(ref, ctx as never);
+    expect(result?.targetNodeId).toBe(guid.id);
+    expect(result?.confidence).toBeGreaterThanOrEqual(0.9);
+  });
+
+  it('passes the widened cheap gate for vendor-GUID-only files', () => {
+    // A file whose only EDK2 token is a vendor GUID (no Pcd/gEfi/gEdkii/
+    // STRING_TOKEN) must still be scanned.
+    const src = `#include <PiDxe.h>
+EFI_GUID *G (VOID) { return &gZeroGuid; }`;
+    const { references } = edk2Resolver.extract!('MdeModulePkg/Zero.c', src)!;
+    expect(references.map((r) => r.referenceName)).toContain('gZeroGuid');
+  });
+
+  it('synthesizes a PcdGetEx reference in the pointer form (&TokenSpaceGuid, Pcd)', () => {
+    // `PcdGetEx (&gEfiMdePkgTokenSpaceGuid, PcdDebugPrintErrorLevel)` — the
+    // token-space GUID passed by pointer, comma-separated (PcdLib API shape).
+    const src = `#include <Uefi.h>
+UINTN F (VOID) {
+  return PcdGetEx (&gEfiMdePkgTokenSpaceGuid, PcdDebugPrintErrorLevel);
+}`;
+    const { references } = edk2Resolver.extract!('MdeModulePkg/Foo.c', src)!;
+    const pcd = references.find((r) => r.referenceName === 'PcdDebugPrintErrorLevel');
+    expect(pcd).toBeDefined();
+    expect(pcd!.candidates).toContain('gEfiMdePkgTokenSpaceGuid.PcdDebugPrintErrorLevel');
+  });
+});

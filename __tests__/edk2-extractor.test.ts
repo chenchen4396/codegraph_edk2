@@ -264,6 +264,23 @@ describe('Edk2Extractor — FDF', () => {
     expect(refNames).toContain('MdeModulePkg/Universal/PCD/Dxe/Pcd.inf');
     expect(result.unresolvedReferences[0]!.referenceKind).toBe('imports');
   });
+
+  it('emits INF imports for lines with FILE_GUID = and RuleOverride = modifiers', () => {
+    // OvmfPkgX64.fdf overrides module GUIDs: `INF FILE_GUID = $(UP_CPU_PEI_GUID)
+    // UefiCpuPkg/CpuMpPei/CpuMpPei.inf` — the modifiers must not swallow the
+    // module path.
+    const src = `[FV.FVMAIN_COMPACT]
+  INF FILE_GUID = $(UP_CPU_PEI_GUID) UefiCpuPkg/CpuMpPei/CpuMpPei.inf
+  INF RuleOverride = USE_OLD_VER UefiCpuPkg/CpuDxe/CpuDxe.inf
+  INF RuleOverride = X RuleOverride = Y UefiCpuPkg/CpuDxe/CpuDxe.inf
+  INF FmpDevicePkg/FmpDxe/FmpDxe.inf
+`;
+    const result = extractFromSource('OvmfPkg/OvmfPkgX64.fdf', CRLF(src), 'edk2');
+    const refNames = result.unresolvedReferences.map((r) => r.referenceName);
+    expect(refNames).toContain('UefiCpuPkg/CpuMpPei/CpuMpPei.inf');
+    expect(refNames).toContain('UefiCpuPkg/CpuDxe/CpuDxe.inf');
+    expect(refNames).toContain('FmpDevicePkg/FmpDxe/FmpDxe.inf');
+  });
 });
 
 describe('Edk2Extractor — UNI', () => {
@@ -298,8 +315,14 @@ describe('Edk2Extractor — VFR', () => {
     expect(strRefs).toContain('STR_BOOT_MANAGER_HELP');
     expect(strRefs).toContain('STR_BOOT_DEVICE_FORM_TITLE');
     expect(strRefs).toContain('STR_NULL');
+    // STRING_TOKEN refs are `references`; the `#include "…NvData.h"` line is
+    // an `imports` to the included file.
     result.unresolvedReferences.forEach((r) => {
-      expect(r.referenceKind).toBe('references');
+      if (r.referenceName.endsWith('BootManagerMenuNvData.h')) {
+        expect(r.referenceKind).toBe('imports');
+      } else {
+        expect(r.referenceKind).toBe('references');
+      }
     });
   });
 });
@@ -634,5 +657,197 @@ describe('Edk2Extractor — 3-line UNI split form', () => {
     const mod = result.nodes.find((n) => n.name === 'STR_PROPERTIES_MODULE_NAME');
     expect(mod!.docstring).toBe('FAT File System Lite PEI Module');
     expect(mod!.startLine).toBe(5); // the #string line, not the value line
+  });
+});
+
+describe('Edk2Extractor — Round 4: EDK2-architecture audit fixes', () => {
+  it('accepts lowercase section names ([defines]/[sources]/[depex]/[FixedPcd])', () => {
+    // EDK2 section names are case-insensitive; GoogleTest-mock INFs (and the
+    // real MockTpmMeasurementLib.inf) use all-lowercase headers.
+    const src = `[defines]
+  INF_VERSION = 0x00010015
+  BASE_NAME   = MockTpmMeasurementlib
+  MODULE_TYPE = HOST_APPLICATION
+  LIBRARY_CLASS = TpmMeasurementlib
+
+[sources]
+  MockTpmMeasurementLib.cpp
+
+[packages]
+  MdePkg/MdePkg.dec
+
+[libraryclasses]
+  GoogleTestLib
+
+[depex]
+  gEfiOtherGuid
+
+[FixedPcd]
+  gEfiMdeModulePkgTokenSpaceGuid.PcdFixedThing
+`;
+    const result = extractFromSource(
+      'MdeModulePkg/Test/Mock/Library/GoogleTest/MockTpmMeasurementLib/MockTpmMeasurementLib.inf',
+      CRLF(src),
+      'edk2'
+    );
+    const module = result.nodes.find((n) => n.kind === 'module');
+    expect(module).toBeDefined();
+    expect(module!.name).toBe('MockTpmMeasurementlib');
+    const names = result.unresolvedReferences.map((r) => r.referenceName);
+    expect(names).toContain('GoogleTestLib'); // lowercase [libraryclasses]
+    expect(names).toContain(
+      'MdeModulePkg/Test/Mock/Library/GoogleTest/MockTpmMeasurementLib/MockTpmMeasurementLib.cpp'
+    );
+    // [depex] + [FixedPcd] (lowercase and legacy names) both emit references
+    // (PCD refs carry the token-space-qualified name as the candidate).
+    expect(names).toContain('gEfiOtherGuid');
+    expect(names).toContain('PcdFixedThing');
+    const fixedPcd = result.unresolvedReferences.find((r) => r.referenceName === 'PcdFixedThing');
+    expect(fixedPcd!.candidates).toContain('gEfiMdeModulePkgTokenSpaceGuid.PcdFixedThing');
+  });
+
+  it('expands [Defines] DEFINE macros in [Sources] paths', () => {
+    // TcgTpmPkg/Library/TpmLib/TpmLib.inf pattern: 200+ vendored sources are
+    // listed as `$(TPM_LIB_PATH)/command/…`; the macro is DEFINE'd in the
+    // same INF. Without expansion the module loses its source links.
+    const src = `[Defines]
+  INF_VERSION  = 0x00010005
+  BASE_NAME    = TpmLib
+  MODULE_TYPE  = BASE
+  LIBRARY_CLASS = TpmLib
+
+  DEFINE TPM_LIB_PATH            =  TPM/TPMCmd/tpm/src
+  DEFINE TPM_CONF_PATH           =  TPM/TPMCmd/TpmConfiguration
+
+[Sources]
+  TpmLib.c
+  $(TPM_LIB_PATH)/command/Startup/Startup.c
+  $(TPM_LIB_PATH)/command/Startup/Shutdown.c
+  $(TPM_CONF_PATH)/TpmVendorCommandHandlers/Vendor_TCG_Test.c
+  $(UNKNOWN_MACRO)/mystery.c
+`;
+    const result = extractFromSource('TcgTpmPkg/Library/TpmLib/TpmLib.inf', CRLF(src), 'edk2');
+    const names = result.unresolvedReferences.map((r) => r.referenceName);
+    expect(names).toContain(
+      'TcgTpmPkg/Library/TpmLib/TPM/TPMCmd/tpm/src/command/Startup/Startup.c'
+    );
+    expect(names).toContain(
+      'TcgTpmPkg/Library/TpmLib/TPM/TPMCmd/TpmConfiguration/TpmVendorCommandHandlers/Vendor_TCG_Test.c'
+    );
+    // Unknown macros stay verbatim (the resolver's fileExists gate drops them).
+    expect(names).toContain('TcgTpmPkg/Library/TpmLib/$(UNKNOWN_MACRO)/mystery.c');
+  });
+
+  it('expands the built-in $(MODULE_NAME) macro (build defines it as BASE_NAME)', () => {
+    const src = `[Defines]
+  BASE_NAME   = VarCheckPcdLib
+  MODULE_TYPE = BASE
+
+[Sources]
+  $(MODULE_NAME).c
+`;
+    const result = extractFromSource('MdeModulePkg/Library/VarCheckPcdLib/VarCheckPcdLib.inf', CRLF(src), 'edk2');
+    const names = result.unresolvedReferences.map((r) => r.referenceName);
+    expect(names).toContain('MdeModulePkg/Library/VarCheckPcdLib/VarCheckPcdLib.c');
+  });
+
+  it('emits UNI #include imports (shared string files)', () => {
+    const src = `/** @file
+  Strings.
+**/
+
+#string STR_MISC_BIOS_VERSION  #language en-US "1.0"
+
+#include "SmbiosMiscDxeCommonStrings.uni"
+`;
+    const result = extractFromSource(
+      'ArmPkg/Universal/Smbios/SmbiosMiscDxe/SmbiosMiscDxeStrings.uni',
+      CRLF(src),
+      'edk2'
+    );
+    const names = result.unresolvedReferences.map((r) => r.referenceName);
+    expect(names).toContain(
+      'ArmPkg/Universal/Smbios/SmbiosMiscDxe/SmbiosMiscDxeCommonStrings.uni'
+    );
+    const inc = result.unresolvedReferences.find((r) => r.referenceName.endsWith('SmbiosMiscDxeCommonStrings.uni'));
+    expect(inc!.referenceKind).toBe('imports');
+  });
+
+  it('emits imports for .vfr entries in INF [Sources] (HII forms)', () => {
+    // NetworkPkg Ip4Dxe pattern: the driver's form file is listed in
+    // [Sources]; the VFR formset module must hang off the driver module.
+    const src = `[Defines]
+  BASE_NAME   = Ip4Dxe
+  MODULE_TYPE = UEFI_DRIVER
+
+[Sources]
+  Ip4Driver.c
+  Ip4Config2.vfr
+`;
+    const result = extractFromSource('NetworkPkg/Ip4Dxe/Ip4Dxe.inf', CRLF(src), 'edk2');
+    const names = result.unresolvedReferences.map((r) => r.referenceName);
+    expect(names).toContain('NetworkPkg/Ip4Dxe/Ip4Config2.vfr');
+  });
+
+  it('expands DSC [Defines] DEFINE macros in component/library paths', () => {
+    // IntelFsp2Pkg/Tools/Tests/QemuFspPkg.dsc pattern: `DEFINE FSP_PACKAGE =
+    // QemuFspPkg` with `$(FSP_PACKAGE)/…` component paths — a hardcoded
+    // resolver-side macro table would expand to the WRONG package here.
+    const src = `[Defines]
+  PLATFORM_NAME = QemuFspPkg
+  DEFINE FSP_PACKAGE = QemuFspPkg
+
+[LibraryClasses]
+  FspSecPlatformLib|$(FSP_PACKAGE)/Library/PlatformSecLib/Vtf0PlatformSecTLib.inf
+
+[Components]
+  $(FSP_PACKAGE)/FspHeader/FspHeader.inf
+`;
+    const result = extractFromSource('IntelFsp2Pkg/Tools/Tests/QemuFspPkg.dsc', CRLF(src), 'edk2');
+    const names = result.unresolvedReferences.map((r) => r.referenceName);
+    expect(names).toContain('QemuFspPkg/FspHeader/FspHeader.inf');
+    expect(names).toContain('QemuFspPkg/Library/PlatformSecLib/Vtf0PlatformSecTLib.inf');
+    expect(names.some((n) => n.includes('IntelFsp2Pkg/FspHeader'))).toBe(false);
+  });
+
+  it('expands FDF DEFINE macros in INF lines and !include lines', () => {
+    const src = `DEFINE PLATFORM_MODULES = OvmfPkg/Platform
+[FV.PEIFV]
+  INF $(PLATFORM_MODULES)/PeiMain.inf
+  !include $(PLATFORM_MODULES)/Extra.fdf.inc
+`;
+    const result = extractFromSource('OvmfPkg/Test.fdf', CRLF(src), 'edk2');
+    const names = result.unresolvedReferences.map((r) => r.referenceName);
+    expect(names).toContain('OvmfPkg/Platform/PeiMain.inf');
+    expect(names).toContain('OvmfPkg/Platform/Extra.fdf.inc');
+  });
+});
+
+describe('Edk2Extractor — Round 4b: lowercase DSC', () => {
+  it('accepts lowercase DSC sections and <LibraryClasses> override blocks', () => {
+    const src = `[defines]
+  PLATFORM_NAME = QemuTest
+  FLASH_DEFINITION = QemuTest.fdf
+
+[libraryclasses]
+  UefiLib|MdePkg/Library/UefiLib/UefiLib.inf
+
+[components]
+  MdeModulePkg/Universal/HelloWorld/HelloWorld.inf {
+    <LibraryClasses>
+      PrintLib|MdePkg/Library/BasePrintLib/BasePrintLib.inf
+    <PcdsFixedAtBuild>
+      gEfiMdePkgTokenSpaceGuid.PcdDebugPrintErrorLevel|0x80000000
+  }
+`;
+    const result = extractFromSource('OvmfPkg/QemuTest.dsc', CRLF(src), 'edk2');
+    const names = result.unresolvedReferences.map((r) => r.referenceName);
+    expect(names).toContain('MdePkg/Library/UefiLib/UefiLib.inf');
+    expect(names).toContain('MdeModulePkg/Universal/HelloWorld/HelloWorld.inf');
+    expect(names).toContain('MdePkg/Library/BasePrintLib/BasePrintLib.inf');
+    const pcd = result.unresolvedReferences.find(
+      (r) => r.referenceName === 'PcdDebugPrintErrorLevel'
+    );
+    expect(pcd).toBeDefined();
   });
 });

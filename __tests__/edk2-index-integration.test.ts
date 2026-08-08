@@ -194,7 +194,8 @@ describe('EDK2 round-2: fragments, FLASH_DEFINITION, C headers, assembly', () =>
     fs.mkdirSync(path.join(dir, 'Include/Protocol'), { recursive: true });
     fs.writeFileSync(path.join(dir, 'Include/Protocol/Arp.h'), 'typedef struct _EFI_ARP_PROTOCOL EFI_ARP_PROTOCOL;\n');
     // assembly source + its INF
-    fs.writeFileSync(path.join(dir, 'ResetVec.nasm'), 'BITS 64\n');
+    fs.writeFileSync(path.join(dir, 'CommonMacros.nasm.inc'), '%define FIXED_VECTOR 0x10\n');
+    fs.writeFileSync(path.join(dir, 'ResetVec.nasm'), 'BITS 64\n%include "CommonMacros.nasm.inc"\n');
     fs.writeFileSync(path.join(dir, 'ResetVec.inf'), '[Defines]\n  BASE_NAME = ResetVec\n  MODULE_TYPE = SEC\n\n[Sources]\n  ResetVec.nasm\n'.replace(/\n/g, '\r\n'));
 
     cg = await CodeGraph.init(dir, { index: false });
@@ -256,6 +257,17 @@ describe('EDK2 round-2: fragments, FLASH_DEFINITION, C headers, assembly', () =>
     if (module && asm) {
       const edges = cg.queries.getOutgoingEdges(module.id);
       expect(edges.some((e) => e.kind === 'imports' && e.target === asm.id)).toBe(true);
+    }
+  });
+
+  it('resolved NASM %include → fragment file edge', () => {
+    const asm = cg.queries.getNodesByFile('ResetVec.nasm').find((n) => n.kind === 'file');
+    const inc = cg.queries.getNodesByFile('CommonMacros.nasm.inc').find((n) => n.kind === 'file');
+    expect(asm).toBeDefined();
+    expect(inc).toBeDefined();
+    if (asm && inc) {
+      const edges = cg.queries.getOutgoingEdges(asm.id);
+      expect(edges.some((e) => e.kind === 'imports' && e.target === inc.id)).toBe(true);
     }
   });
 });

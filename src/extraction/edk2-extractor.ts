@@ -143,6 +143,23 @@ export class Edk2Extractor {
     return joined.replace(/\\/g, '/');
   }
 
+  /** Expand `$(NAME)` build macros in a path (INF/DSC [Defines] `DEFINE NAME =
+   * value` lines). `MODULE_NAME` is defined by the build system as BASE_NAME
+   * (INF only). Unknown macros stay verbatim — the resolver's fileExists gate
+   * drops them. */
+  private expandMacros(
+    p: string,
+    macros: Map<string, string>,
+    defines?: Map<string, string>
+  ): string {
+    const moduleName = defines?.get('BASE_NAME');
+    return p.replace(/\$\(([A-Za-z0-9_]+)\)/g, (whole, name: string) => {
+      if (name === 'MODULE_NAME' && moduleName) return moduleName;
+      const v = macros.get(name);
+      return v !== undefined ? v : whole;
+    });
+  }
+
   private emitRef(
     fromNodeId: string,
     referenceName: string,
@@ -197,7 +214,12 @@ export class Edk2Extractor {
         // `[Depex.common.DXE_DRIVER]`, `[PcdsFixedAtBuild.X64]`. Strip ALL
         // dotted segments (the old one-shot strip left `LibraryClasses.common`
         // unmatched); comma lists (`[Sources.Ia32, Sources.X64]`) split first.
+        // Section names are case-insensitive per the EDK2 spec (build tools
+        // accept `[defines]`/`[depex]` — real GoogleTest-mock INFs use them) —
+        // normalize to lowercase once, here, so every consumer compares
+        // lowercase.
         const bases = hdr[1]!
+          .toLowerCase()
           .split(',')
           .map((t) => t.trim().replace(/\.[A-Za-z0-9_]+/g, ''))
           .filter((t) => t.length > 0);
@@ -225,14 +247,24 @@ export class Edk2Extractor {
   private parseInf(): void {
     const sections = Edk2Extractor.splitSections(this.source);
     const defines = new Map<string, string>();
+    const macros = new Map<string, string>(); // `DEFINE NAME = value` build macros
     const sources: string[] = []; // project-relative .c/.cc source paths
     const sourceFiles: { rel: string; line: number }[] = []; // every [Sources] entry
     let moduleUni: { value: string; line: number } | null = null;
     let moduleLine = 1;
 
     for (const sec of sections) {
-      if (sec.name === 'Defines') {
+      if (sec.name === 'defines') {
         for (const { text, line } of sec.lines) {
+          // `DEFINE OPENSSL_PATH = openssl` — build-time macro used in
+          // [Sources] paths (`$(OPENSSL_PATH)/crypto/…`). The build expands
+          // these; the extractor records them so source paths resolve to the
+          // real files (TcgTpmPkg/Library/TpmLib's 200+ TPM sources).
+          const dm = text.match(/^DEFINE\s+([A-Za-z0-9_]+)\s*=\s*(.*)$/i);
+          if (dm && dm[2]!.trim()) {
+            macros.set(dm[1]!, dm[2]!.trim());
+            continue;
+          }
           const m = text.match(/^([A-Za-z0-9_]+)\s*=\s*(.*)$/);
           if (m) {
             defines.set(m[1]!, m[2]!.trim());
@@ -241,13 +273,16 @@ export class Edk2Extractor {
             }
           }
         }
-      } else if (sec.name === 'Sources') {
+      } else if (sec.name === 'sources') {
         for (const { text, line } of sec.lines) {
           // `foo.nasm| INTEL` — a toolcode attached without a separating space.
           const sp = text.split(/\s+/)[0]!.replace(/\|.*$/, '').trim();
-          if (/\.(c|cc|cpp)$/i.test(sp)) sources.push(this.rel(sp));
-          if (/\.(c|cc|cpp|asm|nasm|nasmb|s|asl|aslc|h|uni)$/i.test(sp)) {
-            sourceFiles.push({ rel: this.rel(sp), line });
+          if (/\.(c|cc|cpp)$/i.test(sp)) sources.push(this.rel(this.expandMacros(sp, macros, defines)));
+          // .vfr included: INFs list their HII form file in [Sources]
+          // (NetworkPkg Ip4Dxe → Ip4Config2.vfr) — the formset module must
+          // hang off the driver module.
+          if (/\.(c|cc|cpp|asm|nasm|nasmb|s|asl|aslc|h|uni|vfr)$/i.test(sp)) {
+            sourceFiles.push({ rel: this.rel(this.expandMacros(sp, macros, defines)), line });
           }
         }
       }
@@ -285,35 +320,36 @@ export class Edk2Extractor {
 
     for (const sec of sections) {
       switch (sec.name) {
-        case 'Packages': {
+        case 'packages': {
           for (const { text, line } of sec.lines) {
             const p = text.split(/\s+/)[0]!;
             if (p.endsWith('.dec')) this.emitRef(from, p, 'imports', line);
           }
           break;
         }
-        case 'LibraryClasses': {
+        case 'libraryclasses': {
           for (const { text, line } of sec.lines) {
             const cls = text.split(/\s+/)[0]!;
             if (cls) this.emitRef(from, cls, 'imports', line);
           }
           break;
         }
-        case 'Guids':
-        case 'Protocols':
-        case 'Ppis': {
+        case 'guids':
+        case 'protocols':
+        case 'ppis': {
           for (const { text, line } of sec.lines) {
             const m = text.match(/^(g[A-Za-z0-9_]+)/);
             if (m) this.emitRef(from, m[1]!, 'references', line);
           }
           break;
         }
-        case 'Pcd':
-        case 'PcdsFixedAtBuild':
-        case 'PcdsPatchableInModule':
-        case 'PcdsDynamic':
-        case 'PcdsDynamicEx':
-        case 'FeaturePcd': {
+        case 'pcd':
+        case 'fixedpcd':
+        case 'pcdsfixedatbuild':
+        case 'pcdspatchableinmodule':
+        case 'pcdsdynamic':
+        case 'pcdsdynamicex':
+        case 'featurepcd': {
           for (const { text, line } of sec.lines) {
             const token = text.split('|')[0]!.trim();
             const mm = token.match(/^([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)$/);
@@ -326,7 +362,7 @@ export class Edk2Extractor {
           }
           break;
         }
-        case 'Depex': {
+        case 'depex': {
           for (const { text, line } of sec.lines) {
             const toks = text
               .split(/\s+AND\s+|\s+/i)
@@ -377,7 +413,7 @@ export class Edk2Extractor {
     const defines = new Map<string, string>();
     let pkgUni: { value: string; line: number } | null = null;
     for (const sec of sections) {
-      if (sec.name !== 'Defines') continue;
+      if (sec.name !== 'defines') continue;
       for (const { text, line } of sec.lines) {
         const m = text.match(/^([A-Za-z0-9_]+)\s*=\s*(.*)$/);
         if (m) {
@@ -413,7 +449,7 @@ export class Edk2Extractor {
     if (pkgUni) this.emitRef(moduleNodeId, this.rel(pkgUni.value), 'imports', pkgUni.line);
 
     for (const sec of sections) {
-      if (sec.name === 'LibraryClasses') {
+      if (sec.name === 'libraryclasses') {
         for (const { text, line } of sec.lines) {
           const left = text.split('|')[0]!.trim();
           if (/^[A-Za-z0-9_]+$/.test(left)) {
@@ -432,7 +468,7 @@ export class Edk2Extractor {
             });
           }
         }
-      } else if (sec.name === 'Guids' || sec.name === 'Protocols' || sec.name === 'Ppis') {
+      } else if (sec.name === 'guids' || sec.name === 'protocols' || sec.name === 'ppis') {
         for (const { text, line } of sec.lines) {
           const m = text.match(/^(g[A-Za-z0-9_]+)/);
           if (m) {
@@ -451,7 +487,7 @@ export class Edk2Extractor {
             });
           }
         }
-      } else if (sec.name.startsWith('Pcds')) {
+      } else if (sec.name.startsWith('pcds') || sec.name === 'fixedpcd') {
         for (const { text, line } of sec.lines) {
           // TokenSpaceGuid.PcdName|Value|Type|Token
           const m = text.match(/^([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)\s*\|/);
@@ -483,10 +519,22 @@ export class Edk2Extractor {
   private parseDsc(): void {
     const sections = Edk2Extractor.splitSections(this.source);
     const defines = new Map<string, string>();
+    const macros = new Map<string, string>(); // [Defines] `DEFINE NAME = value`
     let flashDef: { value: string; line: number } | null = null;
     for (const sec of sections) {
-      if (sec.name !== 'Defines') continue;
+      if (sec.name !== 'defines') continue;
       for (const { text, line } of sec.lines) {
+        // `DEFINE FSP_PACKAGE = QemuFspPkg` — platform macros used in
+        // [Components]/[LibraryClasses] paths (`$(FSP_PACKAGE)/X.inf`) and
+        // `!include` lines. The build expands them; without expansion the
+        // component refs can't resolve (and a hardcoded macro table in the
+        // resolver would expand to the WRONG package when the platform
+        // overrides the default — QemuFspPkg.dsc does exactly that).
+        const dm = text.match(/^DEFINE\s+([A-Za-z0-9_]+)\s*=\s*(.*)$/i);
+        if (dm && dm[2]!.trim()) {
+          macros.set(dm[1]!, dm[2]!.trim());
+          continue;
+        }
         const m = text.match(/^([A-Za-z0-9_]+)\s*=\s*(.*)$/);
         if (m) {
           defines.set(m[1]!, m[2]!.trim());
@@ -519,25 +567,25 @@ export class Edk2Extractor {
 
     for (const sec of sections) {
       switch (sec.name) {
-        case 'Packages': {
+        case 'packages': {
           for (const { text, line } of sec.lines) {
             const p = text.split(/\s+/)[0]!;
             if (p.endsWith('.dec')) this.emitRef(from, p, 'imports', line);
           }
           break;
         }
-        case 'LibraryClasses': {
+        case 'libraryclasses': {
           for (const { text, line } of sec.lines) {
             // Class|Path.inf — link to the implementation INF file.
             const after = text.split('|')[1];
             if (after) {
-              const impl = after.trim();
+              const impl = this.expandMacros(after.trim(), macros);
               if (impl.endsWith('.inf')) this.emitRef(from, impl, 'imports', line);
             }
           }
           break;
         }
-        case 'Components': {
+        case 'components': {
           // Path.inf optionally followed by `{ … }` override block containing
           // `<LibraryClasses>` / `<Pcds*>` pseudo-sections — component-scoped
           // library instances and PCD assignments (real: 378 `<LibraryClasses>`
@@ -553,16 +601,20 @@ export class Edk2Extractor {
               }
               const hdr = text.match(/^<([^>]+)>$/);
               if (hdr) {
-                blockSection = hdr[1]!.replace(/\.[A-Za-z0-9_]+$/, ''); // strip .ARCH
+                // `<LibraryClasses.common>` / `<PcdsFixedAtBuild.X64>` —
+                // lowercase for the same case-insensitivity as section names.
+                blockSection = hdr[1]!
+                  .toLowerCase()
+                  .replace(/\.[A-Za-z0-9_]+$/, '');
                 continue;
               }
-              if (blockSection === 'LibraryClasses') {
+              if (blockSection === 'libraryclasses') {
                 const lc = text.match(/^([A-Za-z0-9_]+)\s*\|\s*(\S+\.inf)/);
                 if (lc) {
-                  this.emitRef(from, lc[2]!, 'imports', line);
+                  this.emitRef(from, this.expandMacros(lc[2]!, macros), 'imports', line);
                   continue;
                 }
-              } else if (blockSection && blockSection.startsWith('Pcds')) {
+              } else if (blockSection && blockSection.startsWith('pcds')) {
                 const pcd = text.match(/^([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)\s*\|/);
                 if (pcd) {
                   this.emitRef(from, pcd[2]!, 'references', line, [pcd[1]! + '.' + pcd[2]!]);
@@ -573,14 +625,14 @@ export class Edk2Extractor {
             }
             const m = text.match(/^(\S+\.inf)/);
             if (m) {
-              this.emitRef(from, m[1]!, 'imports', line);
+              this.emitRef(from, this.expandMacros(m[1]!, macros), 'imports', line);
               if (text.includes('{')) inBlock = true;
             }
           }
           break;
         }
         default:
-          if (sec.name.startsWith('Pcds')) {
+          if (sec.name.startsWith('pcds')) {
             for (const { text, line } of sec.lines) {
               const token = text.split('|')[0]!.trim();
               const mm = token.match(/^([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)$/);
@@ -595,11 +647,11 @@ export class Edk2Extractor {
     const rawLines = this.source.split('\n');
     for (let i = 0; i < rawLines.length; i++) {
       const inc = rawLines[i]!.match(/^\s*!include\s+(\S+)/);
-      if (inc) this.emitRef(from, inc[1]!, 'imports', i + 1);
+      if (inc) this.emitRef(from, this.expandMacros(inc[1]!, macros), 'imports', i + 1);
     }
     // The platform's flash layout file — the DSC→FDF link that makes
     // dead-FDF detection possible (an FDF with no incoming edges is unused).
-    if (flashDef) this.emitRef(from, flashDef.value, 'imports', flashDef.line);
+    if (flashDef) this.emitRef(from, this.expandMacros(flashDef.value, macros), 'imports', flashDef.line);
   }
 
   // --------------------------------------------------------------------------
@@ -607,16 +659,27 @@ export class Edk2Extractor {
   // --------------------------------------------------------------------------
   private parseFdf(): void {
     const lines = this.source.split('\n');
-    const re = /^\s*INF\s+(?:RuleOverride=\S+\s+)?(\S+\.inf)\s*$/i;
+    // Top-level `DEFINE NAME = value` statements (FD sizes, but also paths
+    // used in `INF $(NAME)/…` lines on other platforms).
+    const macros = new Map<string, string>();
+    for (const l of lines) {
+      const dm = l.match(/^\s*DEFINE\s+([A-Za-z0-9_]+)\s*=\s*(.*)$/i);
+      if (dm && dm[2]!.trim()) macros.set(dm[1]!, dm[2]!.trim());
+    }
+    // `INF [RuleOverride=…] [FILE_GUID = <guid>] path.inf` — both modifiers
+    // may appear before the module path (OvmfPkgX64.fdf overrides module
+    // FILE_GUIDs this way: `INF FILE_GUID = $(UP_CPU_PEI_GUID)
+    // UefiCpuPkg/CpuMpPei/CpuMpPei.inf`).
+    const re = /^\s*INF\s+(?:(?:RuleOverride|FILE_GUID)\s*=\s*\S+\s+)*(\S+\.inf)\s*$/i;
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i]!;
       const inc = line.match(/^\s*!include\s+(\S+)/);
       if (inc) {
-        this.emitRef(this.fileNodeId, inc[1]!, 'imports', i + 1);
+        this.emitRef(this.fileNodeId, this.expandMacros(inc[1]!, macros), 'imports', i + 1);
         continue;
       }
       const m = line.match(re);
-      if (m) this.emitRef(this.fileNodeId, m[1]!, 'imports', i + 1);
+      if (m) this.emitRef(this.fileNodeId, this.expandMacros(m[1]!, macros), 'imports', i + 1);
     }
   }
 
@@ -632,7 +695,7 @@ export class Edk2Extractor {
     const includeRe = /^\s*!include\s+(\S+)/;
     const libClassRe = /^([A-Za-z0-9_]+)\s*\|\s*(\S+\.inf)/;
     const pcdRe = /^\s*(?:([A-Za-z0-9_]+)\.)?(Pcd[A-Za-z0-9_]+)\s*\|/;
-    const infRe = /^\s*INF\s+(?:RuleOverride=\S+\s+)?(\S+\.inf)\s*$/i;
+    const infRe = /^\s*INF\s+(?:(?:RuleOverride|FILE_GUID)\s*=\s*\S+\s+)*(\S+\.inf)\s*$/i;
     for (let i = 0; i < lines.length; i++) {
       const text = lines[i]!.trim();
       const line = i + 1;
@@ -695,6 +758,13 @@ export class Edk2Extractor {
     for (let i = 0; i < lines.length; i++) {
       const raw = lines[i]!;
       if (raw.trim().startsWith('//')) continue;
+      // `#include "SharedStrings.uni"` — UNI files splice shared string
+      // tokens from other UNI files (SmbiosMiscDxeStrings.uni pattern).
+      const inc = raw.match(/^\s*#include\s+["<]([^">]+)[">]/);
+      if (inc) {
+        this.emitRef(this.fileNodeId, this.rel(inc[1]!), 'imports', i + 1);
+        continue;
+      }
       // Combined form: `#string STR_X #language en-US "value"`.
       const m = raw.match(/^\s*#string\s+([A-Za-z0-9_]+)\s+#language\s+\S+\s+"(.*)"\s*$/);
       if (m) {
@@ -739,6 +809,15 @@ export class Edk2Extractor {
     const stripped = this.source
       .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '))
       .replace(/\/\/[^\n]*/g, (m) => ' '.repeat(m.length));
+
+    // `#include "X.vfr"` — VFR files share forms/structures across drivers
+    // (NetworkPkg Ip4Config2.vfr pattern).
+    const incRe = /^\s*#include\s+["<]([^">]+)[">]/gm;
+    let incM: RegExpExecArray | null;
+    while ((incM = incRe.exec(this.source)) !== null) {
+      const incLine = this.source.slice(0, incM.index).split('\n').length;
+      this.emitRef(this.fileNodeId, this.rel(incM[1]!), 'imports', incLine);
+    }
 
     // formset module node — name from the formset title STRING_TOKEN, else file.
     let formsetName: string | null = null;

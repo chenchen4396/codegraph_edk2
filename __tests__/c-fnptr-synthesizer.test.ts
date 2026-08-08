@@ -370,6 +370,44 @@ void setup(int *L) {
   // This is the pass that parks the "Linking dynamic dispatch" bar on C-heavy
   // repos, so it reports a within-pass fraction of its file sweeps. Pin that
   // the fractions arrive, stay in (0, 1], and never go backwards.
+  it('bridges an EDK2-style service table (cast-wrapped entries) dispatched through an extern global pointer', async () => {
+    // EDK2 registers BootServices with explicit prototype casts —
+    // `EFI_BOOT_SERVICES mBootServices = { (EFI_ALLOCATE_PAGES)CoreAllocatePages, … }`
+    // (DxeMain.c) — and consumers dispatch through the extern global
+    // `gBS->LocateProtocol(…)`. The cast must be peeled on registration.
+    write('dxe.c', `
+typedef int (*ALLOCATE_PAGES_FN)(int pages);
+typedef int (*LOCATE_PROTOCOL_FN)(void);
+typedef struct {
+  ALLOCATE_PAGES_FN   AllocatePages;
+  LOCATE_PROTOCOL_FN  LocateProtocol;
+} EFI_BOOT_SERVICES;
+typedef struct {
+  ALLOCATE_PAGES_FN   AllocatePages;
+} EFI_PEI_SERVICES;
+static int CoreAllocatePages(int pages) { return pages; }
+static int CoreLocateProtocol(void) { return 0; }
+EFI_BOOT_SERVICES mBootServices = {
+  (ALLOCATE_PAGES_FN)CoreAllocatePages,
+  CoreLocateProtocol,
+};
+`);
+    write('consumer.c', `
+extern EFI_BOOT_SERVICES *gBS;
+int AllocateBootPerformanceTable(void) {
+  gBS->LocateProtocol();
+  return gBS->AllocatePages(4);
+}
+`);
+    const edges = await load();
+    // Unique-owner field: gBS's type is an extern pointer (unresolvable), so
+    // the single-owner fallback carries LocateProtocol → CoreLocateProtocol.
+    expect(has(edges, 'AllocateBootPerformanceTable', 'CoreLocateProtocol')).toBe(true);
+    // PRECISION: AllocatePages belongs to BOTH EFI_BOOT_SERVICES and
+    // EFI_PEI_SERVICES — two owners, no unique-owner fallback, no edge.
+    expect(has(edges, 'AllocateBootPerformanceTable', 'CoreAllocatePages')).toBe(false);
+  });
+
   it('reports a monotonic within-pass progress fraction over its file sweeps', async () => {
     // Enough files to cross the per-16-files reporting cadence several times
     // across the four file sweeps.

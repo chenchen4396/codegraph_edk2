@@ -41,10 +41,22 @@ import type {
   FrameworkExtractionResult,
 } from '../types';
 
+// FeaturePcdGet/FeaturePcdSet are the BOOLEAN feature-PCD accessors (NetworkPkg
+// gates, e.g. `FeaturePcdGet(PcdNetworkIp4Protocol)`); the leading `\b` keeps
+// them from being shadowed by the `Pcd` alternative inside `FeaturePcd`.
+// The token-space group covers BOTH spellings: `gEfiMdePkgTokenSpaceGuid.PcdX`
+// (dotted) and `PcdGetEx (&gEfiMdePkgTokenSpaceGuid, PcdX)` (pointer form).
 const PCD_USAGE_RE =
-  /\b(?:Pcd|FixedPcd|PatchPcd)(?:Get|Set)(?:Ex)?(?:8|16|32|64|Ptr|Size|Bool)?S?\s*\(\s*(?:&\s*)?(?:([A-Za-z0-9_]+)PkgTokenSpaceGuid\s*\.)?\s*(Pcd[A-Za-z0-9_]+)\b/g;
+  /\b(?:Pcd|FixedPcd|PatchPcd|FeaturePcd)(?:Get|Set)(?:Ex)?(?:8|16|32|64|Ptr|Size|Bool)?S?\s*\(\s*(?:(?:&\s*)?([A-Za-z0-9_]+)PkgTokenSpaceGuid\s*[.,]\s*)?(Pcd[A-Za-z0-9_]+)\b/g;
 
-const GUID_USAGE_RE = /\b(g(?:Efi|Edkii)[A-Za-z0-9_]*(?:ProtocolGuid|PpiGuid|Guid))\b/g;
+// GUID / PPI / protocol usage: any `g<Cap>…(ProtocolGuid|PpiGuid|Guid)` —
+// vendor/custom GUIDs (gAcpiTableHobGuid, gZeroGuid, gAmiXxxProtocolGuid …)
+// are as graph-relevant as the gEfi*/gEdkii* canon; refs that name no DEC
+// constant simply stay unresolved. Token-space GUIDs
+// (gEfiMdePkgTokenSpaceGuid) also match and resolve to their DEC [Guids]
+// entry, while the PCD accessor regex additionally captures the qualified
+// PCD name.
+const GUID_USAGE_RE = /\b(g[A-Z][A-Za-z0-9_]*(?:ProtocolGuid|PpiGuid|Guid))\b/g;
 
 // HII string-token usage: `STRING_TOKEN (STR_X)` in C — the token is declared
 // as a constant in a `.uni` file (same simple-name contract as PCD/GUID).
@@ -199,12 +211,16 @@ export const edk2Resolver: FrameworkResolver = {
       return { nodes: [], references: [] };
     }
     // Cheap gate: skip headers/sources with no EDK2 token at all (avoids
-    // minting refs for thousands of plain-C files in a mixed tree).
+    // minting refs for thousands of plain-C files in a mixed tree). Must
+    // cover the widened GUID pattern too — a file mentioning only a vendor
+    // GUID (gZeroGuid, gAcpiTableHobGuid…) has no `gEfi`/`gEdkii` token.
+    const gate = content.slice(0, 65536);
     if (
-      content.indexOf('Pcd') === -1 &&
-      content.indexOf('gEfi') === -1 &&
-      content.indexOf('gEdkii') === -1 &&
-      content.indexOf('STRING_TOKEN') === -1
+      gate.indexOf('Pcd') === -1 &&
+      gate.indexOf('gEfi') === -1 &&
+      gate.indexOf('gEdkii') === -1 &&
+      gate.indexOf('STRING_TOKEN') === -1 &&
+      !/g[A-Z][A-Za-z0-9_]*(?:ProtocolGuid|PpiGuid|Guid)\b/.test(gate)
     ) {
       return { nodes: [], references: [] };
     }
