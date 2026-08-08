@@ -956,3 +956,59 @@ endformset;
     expect(detectLanguage('odd.inc', 'just some text\n')).toBe('php');
   });
 });
+
+describe('Edk2Extractor — round-9: dedup, DSC block shapes', () => {
+  it('comma-list sections emit each ref once (dedup)', () => {
+    const src = `[Defines]
+  BASE_NAME = Multi
+  MODULE_TYPE = DXE_DRIVER
+
+[Sources.Ia32, Sources.X64]
+  Multi.c
+  MultiX64.c
+`;
+    const result = extractFromSource('VendorPkg/Multi/Multi.inf', CRLF(src), 'edk2');
+    const names = result.unresolvedReferences.map((r) => r.referenceName);
+    const count = names.filter((n) => n === 'VendorPkg/Multi/Multi.c').length;
+    expect(count).toBe(1);
+    expect(names).toContain('VendorPkg/Multi/MultiX64.c');
+  });
+
+  it('DSC component override block opens with a lone { on the next line', () => {
+    const src = `[Defines]
+  PLATFORM_NAME = BraceNext
+  FLASH_DEFINITION = BraceNext.fdf
+
+[Components]
+  VendorPkg/Drv/Drv.inf
+  {
+    <LibraryClasses>
+      PrintLib|VendorPkg/Lib/PrintLib.inf
+    <PcdsFixedAtBuild>
+      gEfiMdePkgTokenSpaceGuid.PcdDebugPrintErrorLevel|0x80000000
+  }
+`;
+    const result = extractFromSource('Platform/BraceNext.dsc', CRLF(src), 'edk2');
+    const names = result.unresolvedReferences.map((r) => r.referenceName);
+    expect(names).toContain('VendorPkg/Drv/Drv.inf');
+    expect(names).toContain('VendorPkg/Lib/PrintLib.inf');
+  });
+
+  it('inner block section names with multiple dotted segments match (LibraryClasses.common.PEIM)', () => {
+    const src = `[Defines]
+  PLATFORM_NAME = MultiSeg
+  FLASH_DEFINITION = MultiSeg.fdf
+
+[Components]
+  VendorPkg/Drv/Drv.inf {
+    <LibraryClasses.common.PEIM>
+      PcdLib|VendorPkg/Lib/PcdLib.inf
+    <PcdsFixedAtBuild.X64>
+      gEfiMdePkgTokenSpaceGuid.PcdDebugPrintErrorLevel|0x80000000
+  }
+`;
+    const result = extractFromSource('Platform/MultiSeg.dsc', CRLF(src), 'edk2');
+    const names = result.unresolvedReferences.map((r) => r.referenceName);
+    expect(names).toContain('VendorPkg/Lib/PcdLib.inf');
+  });
+});

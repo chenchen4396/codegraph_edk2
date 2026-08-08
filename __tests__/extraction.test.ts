@@ -6978,6 +6978,20 @@ describe('Directory Exclusion', () => {
     const ig = buildDefaultIgnore(tempDir);
     expect(ig.ignores('app/build/gen.c')).toBe(true);
   });
+
+  it('should carve out the build source in a NESTED EDK2 layout (<root>/edk2/BaseTools/…)', () => {
+    // Container-repo / Project-Mu vendoring shape: EDK2 lives one level down.
+    fs.mkdirSync(path.join(tempDir, 'edk2', 'BaseTools', 'Source', 'Python', 'build'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'edk2', 'BaseTools', 'Source', 'Python', 'build', 'build.py'), 'print("build tool")\n');
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), 'Build/\n');
+
+    const ig = buildDefaultIgnore(tempDir);
+    expect(ig.ignores('edk2/BaseTools/Source/Python/build/build.py')).toBe(false);
+    // unrelated build/ output still ignored
+    expect(ig.ignores('edk2/OvmfPkg/build/gen.c')).toBe(true);
+    // other BaseTools source is NOT un-ignored by the narrow rule
+    expect(ig.ignores('edk2/BaseTools/Source/C/Common/BinderFuncs.c')).toBe(false);
+  });
 });
 
 describe('Git Submodules', () => {

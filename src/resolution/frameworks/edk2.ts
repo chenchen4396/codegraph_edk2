@@ -44,19 +44,25 @@ import type {
 // FeaturePcdGet/FeaturePcdSet are the BOOLEAN feature-PCD accessors (NetworkPkg
 // gates, e.g. `FeaturePcdGet(PcdNetworkIp4Protocol)`); the leading `\b` keeps
 // them from being shadowed by the `Pcd` alternative inside `FeaturePcd`.
-// The token-space group covers BOTH spellings: `gEfiMdePkgTokenSpaceGuid.PcdX`
-// (dotted) and `PcdGetEx (&gEfiMdePkgTokenSpaceGuid, PcdX)` (pointer form).
+// The token-space group covers ALL spellings: `gEfiMdePkgTokenSpaceGuid.PcdX`
+// (dotted), `gEmbeddedTokenSpaceGuid.PcdX` (no `Pkg` infix — Arm/Embedded),
+// and `PcdGetEx (&gEfiMdePkgTokenSpaceGuid, PcdX)` (pointer form).
+// PCD C-names need NOT start with `Pcd` (Arm platform PCDs:
+// `FixedPcdGet32 (PL011UartClkInHz)`); accept any uppercase-led identifier —
+// lowercase-led identifiers are call-site variables, not PCDs.
 const PCD_USAGE_RE =
-  /\b(?:Pcd|FixedPcd|PatchPcd|FeaturePcd)(?:Get|Set)(?:Ex)?(?:8|16|32|64|Ptr|Size|Bool)?S?\s*\(\s*(?:(?:&\s*)?([A-Za-z0-9_]+)PkgTokenSpaceGuid\s*[.,]\s*)?(Pcd[A-Za-z0-9_]+)\b/g;
+  /\b(?:Pcd|FixedPcd|PatchPcd|FeaturePcd)(?:Get|Set)(?:Ex)?(?:8|16|32|64|Ptr|Size|Bool)?S?\s*\(\s*(?:(?:&\s*)?([A-Za-z0-9_]+)TokenSpaceGuid\s*[.,]\s*)?((?:Pcd[A-Za-z0-9_]+|[A-Z][A-Za-z0-9_]*))\b/g;
 
-// GUID / PPI / protocol usage: any `g<Cap>…(ProtocolGuid|PpiGuid|Guid)` —
-// vendor/custom GUIDs (gAcpiTableHobGuid, gZeroGuid, gAmiXxxProtocolGuid …)
+// GUID / PPI / protocol usage: any `g<Cap>…(ProtocolGuid|PpiGuid|Protocol|Ppi|
+// Guid[_\d+])` — vendor/custom GUIDs (gAcpiTableHobGuid, gZeroGuid, gAmiXxx…)
 // are as graph-relevant as the gEfi*/gEdkii* canon; refs that name no DEC
-// constant simply stay unresolved. Token-space GUIDs
-// (gEfiMdePkgTokenSpaceGuid) also match and resolve to their DEC [Guids]
-// entry, while the PCD accessor regex additionally captures the qualified
-// PCD name.
-const GUID_USAGE_RE = /\b(g[A-Z][A-Za-z0-9_]*(?:ProtocolGuid|PpiGuid|Guid))\b/g;
+// constant simply stay unresolved. Covers legacy spellings without a `Guid`
+// suffix (gEfiMmEndOfPeiProtocol, gEfiPeiMmConfigurationPpi) and
+// version-suffixed GUIDs (gEfiNetworkInterfaceIdentifierProtocolGuid_31).
+// Token-space GUIDs (gEfiMdePkgTokenSpaceGuid) also match and resolve to
+// their DEC [Guids] entry, while the PCD accessor regex additionally
+// captures the qualified PCD name.
+const GUID_USAGE_RE = /\b(g[A-Z][A-Za-z0-9_]*(?:ProtocolGuid|PpiGuid|Protocol|Ppi|Guid(?:_\d+)?))\b/g;
 
 // HII string-token usage: `STRING_TOKEN (STR_X)` in C — the token is declared
 // as a constant in a `.uni` file (same simple-name contract as PCD/GUID).
@@ -83,8 +89,10 @@ function buildIncludeIndex(context: ResolutionContext): Map<string, string[]> {
   const allFiles = new Set<string>();
   for (const n of context.getNodesByKind('file')) {
     // BaseTools/Source/C/Include vendored build-tool headers shadow the MdePkg
-    // canon for names like `Protocol/DevicePath.h` — never let them win.
-    if (n.filePath.startsWith('BaseTools/')) continue;
+    // canon for names like `Protocol/DevicePath.h` — never let them win. Path
+    // segments (not prefix): nested-EDK2 layouts put BaseTools under
+    // `<repo>/edk2/BaseTools/…`.
+    if (n.filePath.split('/').includes('BaseTools')) continue;
     allFiles.add(n.filePath);
     const m = /\/Include\/(.+)$/.exec(n.filePath);
     if (m) add(m[1]!, n.filePath);
@@ -131,7 +139,11 @@ function buildIncludeIndex(context: ResolutionContext): Map<string, string[]> {
 
 export const edk2Resolver: FrameworkResolver = {
   name: 'edk2',
-  languages: ['edk2', 'c'],
+  // `cpp` included: UEFI C++ sources (.cpp/.cc — GoogleTest hosts,
+  // NetworkPkg/RedfishPkg/EmulatorPkg) carry the same PCD/GUID/STRING_TOKEN
+  // usage and must get synthetic refs too. Safe for non-EDK2 C++ projects:
+  // detect() requires a `.dec`, and extract()'s cheap gate short-circuits.
+  languages: ['edk2', 'c', 'cpp'],
 
   detect(context: ResolutionContext): boolean {
     return context.getAllFiles().some((f) => f.toLowerCase().endsWith('.dec'));
@@ -284,7 +296,7 @@ export const edk2Resolver: FrameworkResolver = {
       content.indexOf('gEfi') === -1 &&
       content.indexOf('gEdkii') === -1 &&
       content.indexOf('STRING_TOKEN') === -1 &&
-      !/g[A-Z][A-Za-z0-9_]*(?:ProtocolGuid|PpiGuid|Guid)\b/.test(content)
+      !/g[A-Z][A-Za-z0-9_]*(?:ProtocolGuid|PpiGuid|Protocol|Ppi|Guid(?:_\d+)?)\b/.test(content)
     ) {
       return { nodes: [], references: [] };
     }
@@ -296,18 +308,21 @@ export const edk2Resolver: FrameworkResolver = {
     const references: UnresolvedRef[] = [];
     const seen = new Set<string>();
 
+    // Line/column from a byte offset: one scan builds the line-start index,
+    // then binary search — O(log n) per ref instead of O(offset).
+    const lineStarts: number[] = [0];
+    for (let i = 0; i < content.length; i++) {
+      if (content.charCodeAt(i) === 0x0a /* \n */) lineStarts.push(i + 1);
+    }
     const lineCol = (offset: number): { line: number; column: number } => {
-      let line = 1;
-      let col = 0;
-      for (let i = 0; i < offset && i < content.length; i++) {
-        if (content.charCodeAt(i) === 0x0a /* \n */) {
-          line++;
-          col = 0;
-        } else {
-          col++;
-        }
+      let lo = 0;
+      let hi = lineStarts.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (lineStarts[mid]! <= offset) lo = mid;
+        else hi = mid - 1;
       }
-      return { line, column: col };
+      return { line: lo + 1, column: offset - lineStarts[lo]! };
     };
 
     const emit = (referenceName: string, candidates: string[] | undefined, offset: number) => {
@@ -332,10 +347,10 @@ export const edk2Resolver: FrameworkResolver = {
     let m: RegExpExecArray | null;
     PCD_USAGE_RE.lastIndex = 0;
     while ((m = PCD_USAGE_RE.exec(content)) !== null) {
-      const tokenSpace = m[1]; // e.g. gEfiMdePkg (without the TokenSpaceGuid suffix)
+      const tokenSpace = m[1]; // e.g. gEfiMdePkg, gEmbedded
       const pcdName = m[2]!;
       const full = tokenSpace
-        ? `${tokenSpace}PkgTokenSpaceGuid.${pcdName}`
+        ? `${tokenSpace}TokenSpaceGuid.${pcdName}`
         : pcdName;
       emit(pcdName, full === pcdName ? undefined : [full], m.index);
     }

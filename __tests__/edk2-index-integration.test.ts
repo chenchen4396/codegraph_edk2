@@ -471,3 +471,109 @@ describe('EDK2 round-8: generality across any EDK2 tree', () => {
     }
   });
 });
+
+describe('EDK2 round-9: reviewer findings — widened synthesis, .include, clean non-EDK2', () => {
+  let dir: string;
+  let cg: CodeGraph;
+
+  beforeAll(async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'edk2-r9-'));
+    fs.mkdirSync(path.join(dir, 'ArmVirtPkg/Library/Flash'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'ArmPkg'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'MdePkg/Include'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'MdePkg/Library/BaseLib/RiscV64'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'MdePkg/Library/BaseLib/RiscV64/RiscVasm.inc'), { recursive: true });
+    fs.rmSync(path.join(dir, 'MdePkg/Library/BaseLib/RiscV64/RiscVasm.inc'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'MdePkg/Library/BaseLib/RiscV64'), { recursive: true });
+    // DEC with non-Pcd-prefixed PCD + version-suffixed GUID + no-Guid-suffix protocol
+    fs.writeFileSync(
+      path.join(dir, 'ArmPkg/ArmPkg.dec'),
+      '[Defines]\n  PACKAGE_NAME = ArmPkg\n\n[PcdsFixedAtBuild]\n  gArmTokenSpaceGuid.PL011UartClkInHz|1|UINT32|0x1\n\n[Protocols]\n  gEfiMmEndOfPeiProtocol = { 0x8b9e4c91 }\n\n[Guids]\n  gEfiNetworkInterfaceIdentifierProtocolGuid_31 = { 0x1234 }\n'.replace(/\n/g, '\r\n')
+    );
+    // C using all three shapes
+    fs.writeFileSync(
+      path.join(dir, 'ArmVirtPkg/Library/Flash/Flash.c'),
+      '#include <Uefi.h>\n\nUINTN GetClock (VOID) { return FixedPcdGet32 (PL011UartClkInHz); }\nEFI_STATUS F (VOID) { extern EFI_GUID gEfiMmEndOfPeiProtocol; extern EFI_GUID gEfiNetworkInterfaceIdentifierProtocolGuid_31; return 0; }\n'
+    );
+    // GAS .include in RISC-V .S + the fragment it pulls
+    fs.writeFileSync(path.join(dir, 'MdePkg/Library/BaseLib/RiscV64/RiscVasm.inc'), '%define RV64 1\n');
+    fs.writeFileSync(
+      path.join(dir, 'MdePkg/Library/BaseLib/RiscV64/RiscVCacheMgmt.S'),
+      '.include "RiscVasm.inc"\n\n.text\n.globl RiscVCacheMgmt\nRiscVCacheMgmt:\n  ret\n'
+    );
+    fs.writeFileSync(
+      path.join(dir, 'MdePkg/Library/BaseLib/RiscV64/RiscVCacheMgmt.inf'),
+      '[Defines]\n  BASE_NAME = RiscVCacheMgmt\n  MODULE_TYPE = BASE\n\n[Sources]\n  RiscVCacheMgmt.S\n'
+    );
+    // Block-commented include must NOT mint an edge
+    fs.writeFileSync(
+      path.join(dir, 'MdePkg/Library/BaseLib/RiscV64/RiscVMmu.S'),
+      '/* #include "Ghost.inc" */\n\n.text\n.globl RiscVMmu\nRiscVMmu:\n  ret\n'
+    );
+    // Windows-driver INF in a NON-EDK2 project (no .dec anywhere) stays clean
+    fs.mkdirSync(path.join(dir, 'winsys/Driver'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'winsys/Driver/Driver.inf'),
+      '[Version]\n  Signature = "$WINDOWS NT$"\n  Provider = Test\n\n[Manufacturer]\n  %Provider% = Devices\n'.replace(/\n/g, '\r\n')
+    );
+
+    cg = await CodeGraph.init(dir, { index: false });
+    await cg.indexAll();
+  });
+
+  afterAll(() => {
+    cg?.destroy();
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('resolves FixedPcdGet32 (PL011UartClkInHz) to the DEC PCD constant', () => {
+    const pcd = cg.queries.getNodesByName('PL011UartClkInHz').find((n) => n.kind === 'constant');
+    const cFile = cg.queries.getNodesByFile('ArmVirtPkg/Library/Flash/Flash.c').find((n) => n.kind === 'file');
+    expect(pcd).toBeDefined();
+    expect(cFile).toBeDefined();
+    if (pcd && cFile) {
+      const edges = cg.queries.getOutgoingEdges(cFile.id);
+      expect(edges.some((e) => e.kind === 'references' && e.target === pcd.id)).toBe(true);
+    }
+  });
+
+  it('resolves gEfiMmEndOfPeiProtocol and Guid_31 C usage to DEC constants', () => {
+    const cFile = cg.queries.getNodesByFile('ArmVirtPkg/Library/Flash/Flash.c').find((n) => n.kind === 'file');
+    const proto = cg.queries.getNodesByName('gEfiMmEndOfPeiProtocol').find((n) => n.kind === 'constant');
+    const guid31 = cg.queries.getNodesByName('gEfiNetworkInterfaceIdentifierProtocolGuid_31').find((n) => n.kind === 'constant');
+    expect(proto).toBeDefined();
+    expect(guid31).toBeDefined();
+    if (cFile && proto && guid31) {
+      const edges = cg.queries.getOutgoingEdges(cFile.id);
+      expect(edges.some((e) => e.kind === 'references' && e.target === proto.id)).toBe(true);
+      expect(edges.some((e) => e.kind === 'references' && e.target === guid31.id)).toBe(true);
+    }
+  });
+
+  it('links GAS .include to the fragment and ignores block-commented includes', () => {
+    const asm = cg.queries.getNodesByFile('MdePkg/Library/BaseLib/RiscV64/RiscVCacheMgmt.S').find((n) => n.kind === 'file');
+    const inc = cg.queries.getNodesByFile('MdePkg/Library/BaseLib/RiscV64/RiscVasm.inc').find((n) => n.kind === 'file');
+    const ghost = cg.queries.getNodesByFile('MdePkg/Library/BaseLib/RiscV64/Ghost.inc');
+    expect(asm).toBeDefined();
+    expect(inc).toBeDefined();
+    expect(ghost).toHaveLength(0);
+    if (asm && inc) {
+      const edges = cg.queries.getOutgoingEdges(asm.id);
+      expect(edges.some((e) => e.kind === 'imports' && e.target === inc.id)).toBe(true);
+    }
+    const mmu = cg.queries.getNodesByFile('MdePkg/Library/BaseLib/RiscV64/RiscVMmu.S').find((n) => n.kind === 'file');
+    if (mmu) {
+      const edges = cg.queries.getOutgoingEdges(mmu.id);
+      expect(edges.some((e) => e.kind === 'imports')).toBe(false);
+    }
+  });
+
+  it('non-EDK2 Windows INF stays a file node only (no module, no refs)', () => {
+    const file = cg.queries.getNodesByFile('winsys/Driver/Driver.inf').find((n) => n.kind === 'file');
+    expect(file).toBeDefined();
+    const modules = cg.queries.getNodesByFile('winsys/Driver/Driver.inf').filter((n) => n.kind === 'module');
+    expect(modules).toHaveLength(0);
+    const edges = file ? cg.queries.getOutgoingEdges(file.id) : [];
+    expect(edges.filter((e) => e.kind === 'imports' || e.kind === 'references')).toHaveLength(0);
+  });
+});

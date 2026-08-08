@@ -318,21 +318,36 @@ export function buildDefaultIgnore(rootDir: string): Ignore {
   // build output. The generic `build/` default-ignore (gitignore semantics
   // match any depth) would silently drop the EDK2 build tool itself
   // (build.py, BuildReport.py); so does the tree's own `Build/` output rule,
-  // because the `ignore` matcher is case-insensitive. Negate for BaseTools —
-  // added LAST so it beats both the defaults and the merged .gitignore.
-  if (isEdk2Workspace(rootDir)) ig.add('!BaseTools/**');
+  // because the `ignore` matcher is case-insensitive. Negate the build-source
+  // DIRECTORY (not `!…/**` — the matcher short-circuits inside an
+  // already-ignored directory, so only the directory-level negation rescues
+  // its contents). `**/` covers both EDK2-at-root and nested layouts
+  // (`<repo>/edk2/BaseTools/…`, Project-Mu/vendor style). Added LAST so it
+  // beats both the defaults and the merged .gitignore.
+  if (isEdk2Workspace(rootDir)) ig.add('!**/BaseTools/Source/Python/build');
   return ig;
 }
 
 /** EDK2 workspace detection: `BaseTools/` + the canonical build-tool source
  * dir `BaseTools/Source/Python/build/` (present in every EDK2 derivative —
  * tianocore, Project Mu, vendor forks — whether or not it carries the
- * `edksetup` scripts at the root). */
+ * `edksetup` scripts at the root). Nested layouts (<root>/edk2/BaseTools/…)
+ * count too: the one-directory probe covers the standard vendoring shapes. */
 function isEdk2Workspace(rootDir: string): boolean {
+  const probe = (base: string): boolean =>
+    fs.existsSync(path.join(base, 'BaseTools', 'Source', 'Python', 'build'));
+  if (probe(rootDir)) return true;
+  // Nested: a container repo with the EDK2 tree in a subdirectory.
+  try {
+    for (const entry of fs.readdirSync(rootDir, { withFileTypes: true })) {
+      if (entry.isDirectory() && probe(path.join(rootDir, entry.name))) return true;
+    }
+  } catch {
+    // unreadable root — fall through to root-only
+  }
   return (
     fs.existsSync(path.join(rootDir, 'BaseTools')) &&
-    (fs.existsSync(path.join(rootDir, 'BaseTools', 'Source', 'Python', 'build')) ||
-      fs.existsSync(path.join(rootDir, 'edksetup.sh')) ||
+    (fs.existsSync(path.join(rootDir, 'edksetup.sh')) ||
       fs.existsSync(path.join(rootDir, 'edksetup.bat')))
   );
 }

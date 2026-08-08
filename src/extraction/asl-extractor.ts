@@ -49,12 +49,15 @@ export class AslExtractor {
     // table fragments with BOTH `Include ("X.asi")` (IASL form) and
     // `#include "X.asi"` (cpp form — ManageabilityPkg's BmcSsdt.asl includes
     // IpmiOprRegions.asi). The .asi fragments are indexed as asl-language
-    // file nodes; these refs give the table → fragment edge.
+    // file nodes; these refs give the table → fragment edge. Block comments
+    // (`/** @file … */` headers) are stripped first so a commented-out
+    // Include can't mint a fake edge (VFR precedent).
     const unresolvedReferences: ExtractionResult['unresolvedReferences'] = [];
+    const stripped = this.source.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '));
     const includeRe = /^\s*(?:#\s*include|Include)\s*\(?\s*["<]([^">]+)[">]/gim;
     let incM: RegExpExecArray | null;
-    while ((incM = includeRe.exec(this.source)) !== null) {
-      const incLine = this.source.slice(0, incM.index).split('\n').length;
+    while ((incM = includeRe.exec(stripped)) !== null) {
+      const incLine = stripped.slice(0, incM.index).split('\n').length;
       unresolvedReferences.push({
         fromNodeId: this.fileNodeId,
         referenceName: this.rel(incM[1]!),

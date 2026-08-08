@@ -6753,23 +6753,27 @@ export function extractFromSource(
       endColumn: 0,
       updatedAt: Date.now(),
     };
-    // NASM `%include "fragment.nasm.inc"` and GNU-as `#include "AsmMacroIoLib.inc"`
-    // (ARM/RISC-V .S sources) — link the macro fragment (indexed as an
-    // assembly file node) to its includer. EDK2 builds pass `-I` include dirs
-    // (MdePkg/Include, …), so an include name is EITHER relative to the
-    // including file OR relative to a declared include dir (`Register/….h` in
-    // BaseLib's .S files, `AArch64/AArch64.h` in ArmLib) — emit both forms;
-    // the edk2 resolver resolves each via fileExists / the include index
-    // (relative-join wins when both exist — NASM's search order).
+    // NASM `%include "fragment.nasm.inc"`, GNU-as `#include "AsmMacroIoLib.inc"`
+    // AND GAS `.include "RiscVasm.inc"` (RISC-V .S) — EDK2 builds pass `-I`
+    // include dirs (MdePkg/Include, …), so an include name is EITHER relative
+    // to the including file OR relative to a declared include dir
+    // (`Register/….h` in BaseLib's .S files, `AArch64/AArch64.h` in ArmLib) —
+    // emit both forms; the edk2 resolver resolves each via fileExists / the
+    // include index (relative-join wins when both exist — NASM's search order).
+    // Quoted (`"x"`), angle (`<x>`), and bare (`x`) targets are accepted
+    // (MASM/GAS both allow unquoted); a leading `.`/`#`/`%` prefix covers the
+    // directive families. Comment stripping happens first so a `/* */`-blocked
+    // include can't mint a fake edge (VFR precedent).
     const dir = path.dirname(filePath) === '.' ? '' : path.dirname(filePath);
     const unresolvedReferences: UnresolvedReference[] = [];
-    const includeRe = /^\s*#?%?include\s+["<]([^">]+)[">]/gm;
+    const stripped = source.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '));
+    const includeRe = /^\s*\.?[#%]?include\s+["<]?([^\s">]+)/gm;
     let incM: RegExpExecArray | null;
-    while ((incM = includeRe.exec(source)) !== null) {
+    while ((incM = includeRe.exec(stripped)) !== null) {
       const raw = incM[1]!;
       const joined = dir ? path.posix.join(dir, raw).replace(/\\/g, '/') : raw;
-      const line = source.slice(0, incM.index).split('\n').length;
-      const column = incM.index - (source.lastIndexOf('\n', incM.index - 1) + 1);
+      const line = stripped.slice(0, incM.index).split('\n').length;
+      const column = incM.index - (stripped.lastIndexOf('\n', incM.index - 1) + 1);
       const emit = (referenceName: string) =>
         unresolvedReferences.push({
           fromNodeId: fileNode.id,

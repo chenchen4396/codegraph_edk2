@@ -38,6 +38,7 @@ export class Edk2Extractor {
   private nodes: Node[] = [];
   private edges: Edge[] = [];
   private unresolvedReferences: UnresolvedReference[] = [];
+  private seenRefs = new Set<string>();
   private errors: ExtractionError[] = [];
   private fileNodeId = '';
   private now = Date.now();
@@ -175,6 +176,13 @@ export class Edk2Extractor {
     line: number,
     candidates?: string[]
   ): void {
+    // Dedup: comma-list section headers (`[Sources.Ia32, Sources.X64]`) push
+    // each body line into every section copy, so the same ref would be
+    // emitted 2-4×; unresolved_refs has no unique constraint, so duplicates
+    // would persist and each re-run resolveOne. First occurrence wins.
+    const key = `${fromNodeId}\u0000${referenceKind}\u0000${referenceName}`;
+    if (this.seenRefs.has(key)) return;
+    this.seenRefs.add(key);
     this.unresolvedReferences.push({
       fromNodeId,
       referenceName,
@@ -617,7 +625,8 @@ export class Edk2Extractor {
           // Path.inf optionally followed by `{ … }` override block containing
           // `<LibraryClasses>` / `<Pcds*>` pseudo-sections — component-scoped
           // library instances and PCD assignments (real: 378 `<LibraryClasses>`
-          // in the tianocore corpus).
+          // in the tianocore corpus). The brace may sit on the INF line itself
+          // or the next line (both spellings occur across vendor trees).
           let inBlock = false;
           let blockSection: string | null = null;
           for (const { text, line } of sec.lines) {
@@ -629,11 +638,10 @@ export class Edk2Extractor {
               }
               const hdr = text.match(/^<([^>]+)>$/);
               if (hdr) {
-                // `<LibraryClasses.common>` / `<PcdsFixedAtBuild.X64>` —
-                // lowercase for the same case-insensitivity as section names.
-                blockSection = hdr[1]!
-                  .toLowerCase()
-                  .replace(/\.[A-Za-z0-9_]+$/, '');
+                // `<LibraryClasses.common.PEIM>` / `<PcdsFixedAtBuild.X64>` —
+                // lowercase, ALL dotted segments stripped (arch/module-type
+                // qualifiers), same case-insensitivity as section names.
+                blockSection = hdr[1]!.toLowerCase().replace(/\.[A-Za-z0-9_]+/g, '');
                 continue;
               }
               if (blockSection === 'libraryclasses') {
@@ -655,7 +663,10 @@ export class Edk2Extractor {
             if (m) {
               this.emitRef(from, this.expandMacros(m[1]!, macros), 'imports', line);
               if (text.includes('{')) inBlock = true;
+              continue;
             }
+            // A lone `{` on the line after the INF path opens the override block.
+            if (/^\{/.test(text)) inBlock = true;
           }
           break;
         }

@@ -778,10 +778,13 @@ export function blankEdk2Constructs(source: string): string {
  * calling-convention macro no non-EDK2 codebase uses between a return type
  * and function name; `<Uefi.h>` / `<PiDxe.h>` are the framework headers; and
  * `EFI_STATUS` / `EFI_BOOT_SERVICES` are UEFI-only types. Deliberately
- * excludes weak markers (`IN`/`OUT`) that appear in ordinary C. */
+ * excludes weak markers (`IN`/`OUT`) that appear in ordinary C. Full-content
+ * scan: core sources (MdeModulePkg DxeMain/Page.c, 38-92KB) carry their
+ * markers past the first 8KB of license preamble — a truncated gate would
+ * skip EFIAPI pre-blanking for exactly the files that need it. */
 function looksLikeEdk2Source(source: string): boolean {
   return /<Uefi\.h>|<Pi\w*\.h>|\bEFIAPI\b|\bEFI_STATUS\b|\bEFI_BOOT_SERVICES?\b|\bEFI_RUNTIME_SERVICES?\b/.test(
-    source.slice(0, 8192)
+    source
   );
 }
 

@@ -629,3 +629,53 @@ UINTN F (VOID) {
     expect(pcd!.candidates).toContain('gEfiMdePkgTokenSpaceGuid.PcdDebugPrintErrorLevel');
   });
 });
+
+describe('edk2Resolver.extract — round-9 widened synthesis', () => {
+  it('synthesizes PCD refs for non-Pcd-prefixed names (Arm PL011 shape)', () => {
+    const src = `#include <Uefi.h>
+UINTN F(VOID) { return FixedPcdGet32 (PL011UartClkInHz); }`;
+    const { references } = edk2Resolver.extract!('ArmVirtPkg/Flash.c', src)!;
+    const ref = references.find((r) => r.referenceName === 'PL011UartClkInHz');
+    expect(ref).toBeDefined();
+    expect(ref!.referenceKind).toBe('references');
+  });
+
+  it('accepts token spaces without the Pkg infix (gEmbeddedTokenSpaceGuid)', () => {
+    const src = `#include <Uefi.h>
+UINT32 F(VOID) { return PcdGet32 (gEmbeddedTokenSpaceGuid.PcdFdtDeviceTree); }`;
+    const { references } = edk2Resolver.extract!('EmbeddedPkg/F.c', src)!;
+    const ref = references.find((r) => r.referenceName === 'PcdFdtDeviceTree');
+    expect(ref).toBeDefined();
+    expect(ref!.candidates).toContain('gEmbeddedTokenSpaceGuid.PcdFdtDeviceTree');
+  });
+
+  it('synthesizes GUID refs without Guid suffix and version-suffixed GUIDs', () => {
+    const src = `#include <Uefi.h>
+EFI_STATUS F(VOID) {
+  extern EFI_GUID gEfiMmEndOfPeiProtocol;
+  extern EFI_GUID gEfiNetworkInterfaceIdentifierProtocolGuid_31;
+  return 0;
+}`;
+    const { references } = edk2Resolver.extract!('StandaloneMmPkg/Core.c', src)!;
+    expect(references.some((r) => r.referenceName === 'gEfiMmEndOfPeiProtocol')).toBe(true);
+    expect(references.some((r) => r.referenceName === 'gEfiNetworkInterfaceIdentifierProtocolGuid_31')).toBe(true);
+    // NOT the variable-declaration suffix (`_SEEN` is not a GUID version)
+    expect(references.some((r) => r.referenceName === 'gEfiArpProtocolGuid_SEEN')).toBe(false);
+  });
+
+  it('synthesizes PCD/GUID refs from .cpp sources (UEFI C++ hosts)', () => {
+    const src = `#include <Uefi.h>
+TEST_F(Foo, Bar) {
+  UINT32 v = PcdGet8 (PcdDebugPropertyMask);
+}`;
+    const { references } = edk2Resolver.extract!('UnitTestFrameworkPkg/Sample.cpp', src)!;
+    expect(references.some((r) => r.referenceName === 'PcdDebugPropertyMask')).toBe(true);
+  });
+
+  it('does not mint refs for lowercase-led identifiers inside PCD accessors', () => {
+    const src = `#include <Uefi.h>
+UINT32 F(VOID) { UINT32 x = 0; return PcdGet32 (x); }`;
+    const { references } = edk2Resolver.extract!('MdePkg/F.c', src)!;
+    expect(references.some((r) => r.referenceName === 'x')).toBe(false);
+  });
+});
