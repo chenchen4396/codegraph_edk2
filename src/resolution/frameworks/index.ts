@@ -29,6 +29,7 @@ import { expoModulesResolver } from './expo-modules';
 import { fabricViewResolver } from './fabric';
 import { cicsResolver } from './cics';
 import { terraformResolver } from './terraform';
+import { edk2Resolver } from './edk2';
 
 /**
  * All registered framework resolvers
@@ -76,6 +77,8 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   cicsResolver,
   // Terraform / OpenTofu — disambiguate var/local/module/resource refs to same-dir module
   terraformResolver,
+  // EDK2 / UEFI — descriptor files (INF/DSC/FDF/DEC/UNI/VFR) + C↔descriptor bridging
+  edk2Resolver,
 ];
 
 /**
@@ -152,3 +155,4 @@ export { swiftObjcBridgeResolver } from './swift-objc';
 export { reactNativeBridgeResolver } from './react-native';
 export { expoModulesResolver } from './expo-modules';
 export { fabricViewResolver } from './fabric';
+export { edk2Resolver } from './edk2';

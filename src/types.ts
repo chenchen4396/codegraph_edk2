@@ -116,6 +116,7 @@ export const LANGUAGES = [
   'vbnet',
   'erlang',
   'terraform',
+  'edk2',
   'unknown',
 ] as const;
 

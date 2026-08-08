@@ -746,6 +746,40 @@ function looksLikeCudaSource(source: string): boolean {
   );
 }
 
+// EDK2 / UEFI C dialect: `EFIAPI` (the calling-convention macro every UEFI
+// function puts between return type and name), and the parameter-direction
+// qualifier macros `IN` / `OUT` / `OPTIONAL`. The C grammar parses them as
+// bare identifiers, which derails function signatures and parameter types —
+// blanking them pre-parse (offset-preserving) lets tree-sitter see the real
+// `EFI_STATUS Foo(UINTN, VOID*)` shape. `EFIAPI` is EDK2-exclusive (no real C
+// places it between type and name); a content-triggered blank on a non-EDK2
+// file can only whitespace tokens inside comments/strings, which parse the
+// same — the CUDA-dunder rationale. The directive restore below keeps
+// `#define EFIAPI`/`#define IN` macro bodies intact.
+const EDK2_QUALIFIER_RE = /\bEFIAPI\b|\bIN\b|\bOUT\b|\bOPTIONAL\b/g;
+export function blankEdk2Constructs(source: string): string {
+  if (
+    source.indexOf('EFIAPI') === -1 &&
+    source.indexOf('OPTIONAL') === -1 &&
+    source.indexOf('IN') === -1 &&
+    source.indexOf('OUT') === -1
+  ) {
+    return source;
+  }
+  return source.replace(EDK2_QUALIFIER_RE, (m) => ' '.repeat(m.length));
+}
+
+/** Strong content markers for EDK2 / UEFI C source. `EFIAPI` is the UEFI
+ * calling-convention macro no non-EDK2 codebase uses between a return type
+ * and function name; `<Uefi.h>` / `<PiDxe.h>` are the framework headers; and
+ * `EFI_STATUS` / `EFI_BOOT_SERVICES` are UEFI-only types. Deliberately
+ * excludes weak markers (`IN`/`OUT`) that appear in ordinary C. */
+function looksLikeEdk2Source(source: string): boolean {
+  return /<Uefi\.h>|<Pi\w*\.h>|\bEFIAPI\b|\bEFI_STATUS\b|\bEFI_BOOT_SERVICES?\b|\bEFI_RUNTIME_SERVICES?\b/.test(
+    source.slice(0, 8192)
+  );
+}
+
 /**
  * Restore preprocessor-directive lines to their original bytes after the
  * blanking passes ran. The token-level blanks match on shape, not context, so
@@ -1507,6 +1541,13 @@ export function blankCNamedVariadicDefineDots(source: string): string {
  * C++. Offset-preserving. */
 function preParseCSource(source: string): string {
   const inner = blankCKernelAnnotations(blankCCplusplusGuardBodies(source));
+  // EDK2 blank runs BEFORE blankCLeadingAttrMacros: EFIAPI sits between an
+  // all-caps return type (EFI_STATUS) and the function name, so
+  // blankCLeadingAttrMacros would otherwise mistake the return type for a
+  // leading attribute macro and blank it too, leaving `UefiMain(…)` with no
+  // return type. CUDA specifiers start with `__` (not [A-Z]) so they're
+  // immune and stay after the cascade.
+  const edk2PreBlanked = looksLikeEdk2Source(inner) ? blankEdk2Constructs(inner) : inner;
   let blanked = blankCLeadingAttrMacros(
     blankLoneMacroLines(
       blankCStatementMacroCalls(
@@ -1517,7 +1558,7 @@ function preParseCSource(source: string): string {
                 blankCVaArgQualifiedTypeArgs(
                   blankCTypeKeywordArgs(
                     blankCParameterizedAnnotationMacros(
-                      blankCAutoInference(blankCSandwichedAnnotations(inner))
+                      blankCAutoInference(blankCSandwichedAnnotations(edk2PreBlanked))
                     )
                   )
                 )

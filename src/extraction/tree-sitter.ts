@@ -29,6 +29,7 @@ import { AstroExtractor } from './astro-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
+import { Edk2Extractor } from './edk2-extractor';
 import { CfmlExtractor } from './cfml-extractor';
 import { tryKernelExtract, takeDeferredPreParse } from './kernel';
 import {
@@ -6693,6 +6694,11 @@ export function extractFromSource(
     // Custom extractor for MyBatis mapper XML. Non-mapper XML returns just a
     // file node so the watcher tracks it without emitting symbols.
     const extractor = new MyBatisExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'edk2') {
+    // Custom extractor for EDK2 / UEFI descriptor files (INF/DSC/FDF/DEC/UNI/VFR);
+    // non-EDK2 .inf returns just a file node (MyBatis non-mapper fallback).
+    const extractor = new Edk2Extractor(filePath, source);
     result = extractor.extract();
   } else if (detectedLanguage === 'cfml' || detectedLanguage === 'cfscript') {
     // Custom extractor for CFML (.cfc/.cfm) — dialect-switches between the
