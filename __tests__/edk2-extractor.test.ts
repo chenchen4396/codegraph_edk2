@@ -433,3 +433,83 @@ describe('Edk2Extractor — INF [Sources] imports', () => {
     expect(result.unresolvedReferences.every((r) => r.referenceKind === 'imports')).toBe(true);
   });
 });
+
+describe('Edk2Extractor — ASL / aslc / nasm.inc routing', () => {
+  it('routes .asl → asl, .aslc → c, .nasm.inc → assembly via detectLanguage', () => {
+    expect(detectLanguage('OvmfPkg/Bhyve/AcpiTables/Dsdt.asl')).toBe('asl');
+    expect(detectLanguage('OvmfPkg/Bhyve/AcpiTables/Facp.aslc')).toBe('c');
+    expect(detectLanguage('OvmfPkg/ResetVector/X64/PageTables64.nasm.inc')).toBe('assembly');
+    expect(detectLanguage('NetworkPkg/NetworkLibs.dsc.inc')).toBe('edk2');
+  });
+
+  it('parses a DefinitionBlock into a module node + Device/Method constants', () => {
+    const src = `/** @file
+  DSDT for the RAM disk root device.
+**/
+DefinitionBlock (
+  "RamDisk.aml",
+  "SSDT",
+  2,
+  "INTEL ",
+  "RamDisk ",
+  0x1000
+  )
+{
+  Scope (\\_SB)
+  {
+    Device (NVDR)
+    {
+      Name (_HID, "ACPI0012")
+      Name (_STR, Unicode ("NVDIMM Root Device"))
+    }
+    Method (_PIC, 1, NotSerialized)
+    {
+    }
+  }
+}
+`;
+    const result = extractFromSource('MdeModulePkg/Universal/Disk/RamDiskDxe/RamDisk.asl', CRLF(src), 'asl');
+    // file node
+    expect(result.nodes.some((n) => n.kind === 'file' && n.language === 'asl')).toBe(true);
+    // DefinitionBlock → module named by signature
+    const block = result.nodes.find((n) => n.kind === 'module' && n.name === 'SSDT');
+    expect(block).toBeDefined();
+    expect(block!.language).toBe('asl');
+    expect(block!.signature).toBe('DefinitionBlock RamDisk.aml');
+    // Device/Method → constants
+    const dev = result.nodes.find((n) => n.kind === 'constant' && n.name === 'NVDR');
+    expect(dev).toBeDefined();
+    expect(dev!.language).toBe('asl');
+    const method = result.nodes.find((n) => n.kind === 'constant' && n.name === '_PIC');
+    expect(method).toBeDefined();
+    // Name (_HID…) is skipped (noise)
+    expect(result.nodes.some((n) => n.name === '_HID')).toBe(false);
+    // contains edges from file node: module + NVDR + _PIC
+    const fileNode = result.nodes.find((n) => n.kind === 'file')!;
+    const contains = result.edges.filter((e) => e.kind === 'contains' && e.source === fileNode.id);
+    expect(contains).toHaveLength(3);
+  });
+
+  it('degrades a non-ASL file to a file node only', () => {
+    const result = extractFromSource('x.asl', '// just a comment\n', 'asl');
+    expect(result.nodes).toHaveLength(1);
+    expect(result.nodes[0]!.kind).toBe('file');
+  });
+
+  it('emits [Sources] imports for .asl/.aslc entries', () => {
+    const src = `[Defines]
+  BASE_NAME    = AcpiTables
+  MODULE_TYPE  = DXE_DRIVER
+
+[Sources]
+  Dsdt.asl
+  Facp.aslc
+  Main.c
+`;
+    const result = extractFromSource('OvmfPkg/Bhyve/AcpiTables/AcpiTables.inf', CRLF(src), 'edk2');
+    const names = result.unresolvedReferences.map((r) => r.referenceName);
+    expect(names).toContain('OvmfPkg/Bhyve/AcpiTables/Dsdt.asl');
+    expect(names).toContain('OvmfPkg/Bhyve/AcpiTables/Facp.aslc');
+    expect(names).toContain('OvmfPkg/Bhyve/AcpiTables/Main.c');
+  });
+});

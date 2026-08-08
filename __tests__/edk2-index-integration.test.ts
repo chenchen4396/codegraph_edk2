@@ -259,3 +259,70 @@ describe('EDK2 round-2: fragments, FLASH_DEFINITION, C headers, assembly', () =>
     }
   });
 });
+
+describe('EDK2 ASL: asl/aslc sources + nasm.inc routing', () => {
+  let dir: string;
+  let cg: CodeGraph;
+
+  beforeAll(async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'edk2-asl-'));
+    fs.mkdirSync(path.join(dir, 'Pkg/AcpiTables'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'Pkg/AcpiTables/AcpiTables.inf'),
+      '[Defines]\n  BASE_NAME = AcpiTables\n  MODULE_TYPE = DXE_DRIVER\n\n[Sources]\n  Dsdt.asl\n  Facs.aslc\n'.replace(/\n/g, '\r\n')
+    );
+    fs.writeFileSync(
+      path.join(dir, 'Pkg/AcpiTables/Dsdt.asl'),
+      'DefinitionBlock (\n  "Dsdt.aml",\n  "DSDT",\n  2,\n  "TEST ", "Tbl  ", 0x1\n)\n{\n  Scope (\\_SB)\n  {\n    Device (PC00)\n    {\n      Method (_STA, 0)\n    }\n  }\n}\n'.replace(/\n/g, '\r\n')
+    );
+    fs.writeFileSync(
+      path.join(dir, 'Pkg/AcpiTables/Facs.aslc'),
+      '#include <IndustryStandard/Acpi.h>\n\nEFI_ACPI_1_0_FIRMWARE_ACPI_CONTROL_STRUCTURE FACS = { 0x0 };\n'
+    );
+    fs.writeFileSync(path.join(dir, 'Pkg/ResetVec.nasm.inc'), '%define FIXED_VECTOR 0x10\n');
+
+    cg = await CodeGraph.init(dir, { index: false });
+    await cg.indexAll();
+  });
+
+  afterAll(() => {
+    cg?.destroy();
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('indexes .asl as asl with a DefinitionBlock module node', () => {
+    const aslFile = cg.queries.getNodesByFile('Pkg/AcpiTables/Dsdt.asl').find((n) => n.kind === 'file');
+    expect(aslFile).toBeDefined();
+    expect(aslFile!.language).toBe('asl');
+    const block = cg.queries.getNodesByName('DSDT').find((n) => n.kind === 'module' && n.language === 'asl');
+    expect(block).toBeDefined();
+    const dev = cg.queries.getNodesByName('PC00').find((n) => n.kind === 'constant' && n.language === 'asl');
+    expect(dev).toBeDefined();
+  });
+
+  it('indexes .aslc as C (it is C)', () => {
+    const aslcFile = cg.queries.getNodesByFile('Pkg/AcpiTables/Facs.aslc').find((n) => n.kind === 'file');
+    expect(aslcFile).toBeDefined();
+    expect(aslcFile!.language).toBe('c');
+  });
+
+  it('links INF [Sources] to both asl and aslc files', () => {
+    const module = cg.queries.getNodesByName('AcpiTables').find((n) => n.kind === 'module');
+    const aslFile = cg.queries.getNodesByFile('Pkg/AcpiTables/Dsdt.asl').find((n) => n.kind === 'file');
+    const aslcFile = cg.queries.getNodesByFile('Pkg/AcpiTables/Facs.aslc').find((n) => n.kind === 'file');
+    expect(module).toBeDefined();
+    expect(aslFile).toBeDefined();
+    expect(aslcFile).toBeDefined();
+    if (module && aslFile && aslcFile) {
+      const edges = cg.queries.getOutgoingEdges(module.id);
+      expect(edges.some((e) => e.kind === 'imports' && e.target === aslFile.id)).toBe(true);
+      expect(edges.some((e) => e.kind === 'imports' && e.target === aslcFile.id)).toBe(true);
+    }
+  });
+
+  it('indexes .nasm.inc as assembly', () => {
+    const inc = cg.queries.getNodesByFile('Pkg/ResetVec.nasm.inc').find((n) => n.kind === 'file');
+    expect(inc).toBeDefined();
+    expect(inc!.language).toBe('assembly');
+  });
+});

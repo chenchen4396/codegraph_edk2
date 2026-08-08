@@ -235,7 +235,7 @@ export class Edk2Extractor {
         for (const { text, line } of sec.lines) {
           const sp = text.split(/\s+/)[0]!;
           if (/\.(c|cc|cpp)$/i.test(sp)) sources.push(this.rel(sp));
-          if (/\.(c|cc|cpp|asm|nasm|s)$/i.test(sp)) sourceFiles.push({ rel: this.rel(sp), line });
+          if (/\.(c|cc|cpp|asm|nasm|s|asl|aslc)$/i.test(sp)) sourceFiles.push({ rel: this.rel(sp), line });
         }
       }
     }

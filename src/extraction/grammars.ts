@@ -11,7 +11,7 @@ import * as fsp from 'fs/promises';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
 import { Language } from '../types';
 
-export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'astro' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'edk2' | 'assembly' | 'unknown'>;
+export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'astro' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'edk2' | 'assembly' | 'asl' | 'unknown'>;
 
 /**
  * WASM filename map — maps each language to its .wasm grammar file
@@ -185,6 +185,11 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.nasm': 'assembly',
   '.nasmb': 'assembly',
   '.s': 'assembly',
+  // ACPI: `.asl` is ACPI Source Language (custom AslExtractor — DefinitionBlock
+  // / Device / Method); `.aslc` is plain C embedding the compiled table bytes
+  // (structs + #include <IndustryStandard/Acpi.h>) — it IS C.
+  '.asl': 'asl',
+  '.aslc': 'c',
 };
 
 /**
@@ -505,6 +510,9 @@ export function detectLanguage(filePath: string, source?: string, overrides?: Re
   // multi-dot suffix is descriptor syntax spliced into platform files via
   // `!include` — route them to the Edk2Extractor's fragment parser.
   if (/\.(?:dsc|fdf|inf)\.inc$/i.test(filePath)) return 'edk2';
+  // NASM include fragments (`PageTables64.nasm.inc`) — assembly syntax spliced
+  // into .nasm sources via `%include`.
+  if (/\.nasm\.inc$/i.test(filePath)) return 'assembly';
   const lang = (overrides && overrides[ext]) || EXTENSION_MAP[ext] || 'unknown';
 
   // .h files could be C, C++, or Objective-C — check source content
@@ -558,6 +566,7 @@ export function isLanguageSupported(language: Language): boolean {
   if (language === 'properties') return true; // Spring config keys
   if (language === 'edk2') return true; // custom Edk2Extractor (INF/DSC/FDF/DEC/UNI/VFR)
   if (language === 'assembly') return true; // file-level tracking only
+  if (language === 'asl') return true; // custom AslExtractor (ACPI Source Language)
   if (language === 'unknown') return false;
   return language in WASM_GRAMMAR_FILES;
 }
@@ -568,7 +577,7 @@ export function isLanguageSupported(language: Language): boolean {
 export function isGrammarLoaded(language: Language): boolean {
   if (language === 'svelte' || language === 'vue' || language === 'astro' || language === 'liquid' || language === 'razor') return true;
   if (language === 'yaml' || language === 'twig') return true; // no WASM grammar needed
-  if (language === 'xml' || language === 'properties' || language === 'edk2' || language === 'assembly') return true; // no WASM grammar needed
+  if (language === 'xml' || language === 'properties' || language === 'edk2' || language === 'assembly' || language === 'asl') return true; // no WASM grammar needed
   return languageCache.has(language);
 }
 
@@ -589,7 +598,7 @@ export function isFileLevelOnlyLanguage(language: Language): boolean {
  * Get all supported languages (those with grammar definitions).
  */
 export function getSupportedLanguages(): Language[] {
-  return [...(Object.keys(WASM_GRAMMAR_FILES) as GrammarLanguage[]), 'svelte', 'vue', 'astro', 'liquid', 'edk2'];
+  return [...(Object.keys(WASM_GRAMMAR_FILES) as GrammarLanguage[]), 'svelte', 'vue', 'astro', 'liquid', 'edk2', 'asl'];
 }
 
 /**
@@ -679,6 +688,7 @@ export function getLanguageDisplayName(language: Language): string {
     arkts: 'ArkTS',
     edk2: 'EDK2',
     assembly: 'Assembly',
+    asl: 'ASL',
     unknown: 'Unknown',
   };
   return names[language] || language;

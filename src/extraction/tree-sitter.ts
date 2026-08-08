@@ -30,6 +30,7 @@ import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
 import { Edk2Extractor } from './edk2-extractor';
+import { AslExtractor } from './asl-extractor';
 import { CfmlExtractor } from './cfml-extractor';
 import { tryKernelExtract, takeDeferredPreParse } from './kernel';
 import {
@@ -6699,6 +6700,11 @@ export function extractFromSource(
     // Custom extractor for EDK2 / UEFI descriptor files (INF/DSC/FDF/DEC/UNI/VFR);
     // non-EDK2 .inf returns just a file node (MyBatis non-mapper fallback).
     const extractor = new Edk2Extractor(filePath, source);
+    result = extractor.extract();
+  } else if (detectedLanguage === 'asl') {
+    // ACPI Source Language — custom AslExtractor (DefinitionBlock / Device /
+    // Method entries; the .aslc C wrapper routes through the normal C path).
+    const extractor = new AslExtractor(filePath, source);
     result = extractor.extract();
   } else if (detectedLanguage === 'cfml' || detectedLanguage === 'cfscript') {
     // Custom extractor for CFML (.cfc/.cfm) — dialect-switches between the

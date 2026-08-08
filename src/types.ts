@@ -118,6 +118,7 @@ export const LANGUAGES = [
   'terraform',
   'edk2',
   'assembly',
+  'asl',
   'unknown',
 ] as const;
 
