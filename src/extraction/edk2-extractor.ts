@@ -259,7 +259,7 @@ export class Edk2Extractor {
           // `DEFINE OPENSSL_PATH = openssl` — build-time macro used in
           // [Sources] paths (`$(OPENSSL_PATH)/crypto/…`). The build expands
           // these; the extractor records them so source paths resolve to the
-          // real files (TcgTpmPkg/Library/TpmLib's 200+ TPM sources).
+          // real files (vendored-source modules list hundreds of them).
           const dm = text.match(/^DEFINE\s+([A-Za-z0-9_]+)\s*=\s*(.*)$/i);
           if (dm && dm[2]!.trim()) {
             macros.set(dm[1]!, dm[2]!.trim());
@@ -267,8 +267,12 @@ export class Edk2Extractor {
           }
           const m = text.match(/^([A-Za-z0-9_]+)\s*=\s*(.*)$/);
           if (m) {
-            defines.set(m[1]!, m[2]!.trim());
-            if (m[1] === 'MODULE_UNI_FILE' && m[2]!.trim()) {
+            // Defines keys are case-insensitive per the EDK2 spec (build tools
+            // accept `base_name`); normalize so BASE_NAME/MODULE_UNI_FILE etc.
+            // lookups work regardless of spelling.
+            const key = m[1]!.toUpperCase();
+            defines.set(key, m[2]!.trim());
+            if (key === 'MODULE_UNI_FILE' && m[2]!.trim()) {
               moduleUni = { value: m[2]!.trim(), line };
             }
           }
@@ -419,8 +423,9 @@ export class Edk2Extractor {
       for (const { text, line } of sec.lines) {
         const m = text.match(/^([A-Za-z0-9_]+)\s*=\s*(.*)$/);
         if (m) {
-          defines.set(m[1]!, m[2]!.trim());
-          if (m[1] === 'PACKAGE_UNI_FILE' && m[2]!.trim()) {
+          const key = m[1]!.toUpperCase();
+          defines.set(key, m[2]!.trim());
+          if (key === 'PACKAGE_UNI_FILE' && m[2]!.trim()) {
             pkgUni = { value: m[2]!.trim(), line };
           }
         }
@@ -539,8 +544,9 @@ export class Edk2Extractor {
         }
         const m = text.match(/^([A-Za-z0-9_]+)\s*=\s*(.*)$/);
         if (m) {
-          defines.set(m[1]!, m[2]!.trim());
-          if (m[1] === 'FLASH_DEFINITION' && m[2]!.trim().endsWith('.fdf')) {
+          const key = m[1]!.toUpperCase();
+          defines.set(key, m[2]!.trim());
+          if (key === 'FLASH_DEFINITION' && m[2]!.trim().endsWith('.fdf')) {
             flashDef = { value: m[2]!.trim(), line };
           }
         }

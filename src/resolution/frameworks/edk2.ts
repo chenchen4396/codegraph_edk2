@@ -257,13 +257,13 @@ export const edk2Resolver: FrameworkResolver = {
     // minting refs for thousands of plain-C files in a mixed tree). Must
     // cover the widened GUID pattern too — a file mentioning only a vendor
     // GUID (gZeroGuid, gAcpiTableHobGuid…) has no `gEfi`/`gEdkii` token.
-    const gate = content.slice(0, 65536);
+    // Full-content scan: a token past the first 64KB must not be missed.
     if (
-      gate.indexOf('Pcd') === -1 &&
-      gate.indexOf('gEfi') === -1 &&
-      gate.indexOf('gEdkii') === -1 &&
-      gate.indexOf('STRING_TOKEN') === -1 &&
-      !/g[A-Z][A-Za-z0-9_]*(?:ProtocolGuid|PpiGuid|Guid)\b/.test(gate)
+      content.indexOf('Pcd') === -1 &&
+      content.indexOf('gEfi') === -1 &&
+      content.indexOf('gEdkii') === -1 &&
+      content.indexOf('STRING_TOKEN') === -1 &&
+      !/g[A-Z][A-Za-z0-9_]*(?:ProtocolGuid|PpiGuid|Guid)\b/.test(content)
     ) {
       return { nodes: [], references: [] };
     }
