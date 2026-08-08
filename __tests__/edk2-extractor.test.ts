@@ -513,3 +513,126 @@ DefinitionBlock (
     expect(names).toContain('OvmfPkg/Bhyve/AcpiTables/Main.c');
   });
 });
+
+describe('Edk2Extractor — Round 3 audit fixes', () => {
+  it('handles multi-dot section headers ([LibraryClasses.common.PEIM])', () => {
+    const src = `[Defines]
+  PLATFORM_NAME = Test
+
+[LibraryClasses.common.PEIM]
+  DebugLib|MdePkg/Library/BaseDebugLibNull/BaseDebugLibNull.inf
+
+[Components]
+  FooPkg/Foo.inf
+`;
+    const result = extractFromSource('Test.dsc', CRLF(src), 'edk2');
+    const names = result.unresolvedReferences.map((r) => r.referenceName);
+    expect(names).toContain('MdePkg/Library/BaseDebugLibNull/BaseDebugLibNull.inf');
+  });
+
+  it('emits DEC constants from [LibraryClasses.common.Private] sections', () => {
+    const src = `[Defines]
+  PACKAGE_NAME = CryptoPkg
+
+[LibraryClasses.common.Private]
+  OpensslLib|Library/OpensslLib/OpensslLib.inf
+`;
+    const result = extractFromSource('CryptoPkg/CryptoPkg.dec', CRLF(src), 'edk2');
+    expect(result.nodes.some((n) => n.kind === 'constant' && n.name === 'OpensslLib')).toBe(true);
+  });
+
+  it('emits [Depex.common.X] refs', () => {
+    const src = `[Defines]
+  BASE_NAME = Foo
+  MODULE_TYPE = DXE_RUNTIME_DRIVER
+
+[Depex.common.DXE_RUNTIME_DRIVER]
+  gEfiCpuArchProtocolGuid
+`;
+    const result = extractFromSource('Foo.inf', CRLF(src), 'edk2');
+    const names = result.unresolvedReferences.map((r) => r.referenceName);
+    expect(names).toContain('gEfiCpuArchProtocolGuid');
+  });
+
+  it('emits MODULE_UNI_FILE and PACKAGE_UNI_FILE imports', () => {
+    const inf = `[Defines]
+  BASE_NAME      = ArpDxe
+  MODULE_TYPE    = UEFI_DRIVER
+  MODULE_UNI_FILE = ArpDxe.uni
+
+[Sources]
+  ArpMain.c
+`;
+    const infResult = extractFromSource('NetworkPkg/ArpDxe/ArpDxe.inf', CRLF(inf), 'edk2');
+    const infNames = infResult.unresolvedReferences.map((r) => r.referenceName);
+    expect(infNames).toContain('NetworkPkg/ArpDxe/ArpDxe.uni');
+
+    const dec = `[Defines]
+  PACKAGE_NAME     = NetworkPkg
+  PACKAGE_UNI_FILE = NetworkPkg.uni
+`;
+    const decResult = extractFromSource('NetworkPkg/NetworkPkg.dec', CRLF(dec), 'edk2');
+    const decNames = decResult.unresolvedReferences.map((r) => r.referenceName);
+    expect(decNames).toContain('NetworkPkg/NetworkPkg.uni');
+  });
+
+  it('parses the split UNI #language form (#string X / #language en-US "v")', () => {
+    const src = `#string STR_PROPERTIES_ABSTRACT
+#language en-US "Disk Info"
+
+#string STR_DISK_MAIN
+#language en-US "Disk"
+`;
+    const result = extractFromSource('FatPkg/FatPei/FatPeiExtra.uni', CRLF(src), 'edk2');
+    const tokens = result.nodes
+      .filter((n) => n.kind === 'constant')
+      .map((n) => n.name);
+    expect(tokens).toContain('STR_PROPERTIES_ABSTRACT');
+    expect(tokens).toContain('STR_DISK_MAIN');
+    const disk = result.nodes.find((n) => n.name === 'STR_DISK_MAIN');
+    expect(disk!.docstring).toBe('Disk');
+  });
+
+  it('handles [Sources] .h/.uni/.nasmb entries and attached toolcode (nasm|)', () => {
+    const src = `[Defines]
+  BASE_NAME    = BaseCpuLib
+  MODULE_TYPE  = BASE
+
+[Sources]
+  Ia32/CpuSleep.nasm| INTEL
+  CpuLib.h
+  BaseCpuLib.uni
+  ResetVec.nasmb
+`;
+    const result = extractFromSource('MdePkg/Library/BaseCpuLib/BaseCpuLib.inf', CRLF(src), 'edk2');
+    const names = result.unresolvedReferences.map((r) => r.referenceName);
+    expect(names).toContain('MdePkg/Library/BaseCpuLib/Ia32/CpuSleep.nasm');
+    expect(names).toContain('MdePkg/Library/BaseCpuLib/CpuLib.h');
+    expect(names).toContain('MdePkg/Library/BaseCpuLib/BaseCpuLib.uni');
+    expect(names).toContain('MdePkg/Library/BaseCpuLib/ResetVec.nasmb');
+  });
+});
+
+describe('Edk2Extractor — 3-line UNI split form', () => {
+  it('parses #string X / #language en-US / "value" across three lines', () => {
+    const src = `// /** @file
+//  FatPei Localized Strings
+// **/
+
+#string STR_PROPERTIES_MODULE_NAME
+#language en-US
+"FAT File System Lite PEI Module"
+
+#string STR_PROPERTIES_MODULE_ABSTRACT
+#language en-US
+"FAT PEI module"
+`;
+    const result = extractFromSource('FatPkg/FatPei/FatPeiExtra.uni', CRLF(src), 'edk2');
+    const names = result.nodes.filter((n) => n.kind === 'constant').map((n) => n.name);
+    expect(names).toContain('STR_PROPERTIES_MODULE_NAME');
+    expect(names).toContain('STR_PROPERTIES_MODULE_ABSTRACT');
+    const mod = result.nodes.find((n) => n.name === 'STR_PROPERTIES_MODULE_NAME');
+    expect(mod!.docstring).toBe('FAT File System Lite PEI Module');
+    expect(mod!.startLine).toBe(5); // the #string line, not the value line
+  });
+});

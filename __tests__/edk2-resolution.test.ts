@@ -400,3 +400,94 @@ if (Token == STRING_TOKEN (STR_GOP_DUMP_MAIN)) {}
     expect(result?.confidence).toBeGreaterThanOrEqual(0.9);
   });
 });
+
+describe('edk2Resolver — Round 3 audit fixes', () => {
+  it('prefers the same-package header over the first indexed candidate', () => {
+    const shellHdr = mkConstant('PlatformBootManager.h', 'ShellPkg/Include/Library/PlatformBootManager.h', 'ShellPkg/Include/Library/PlatformBootManager.h', 1);
+    const mdeHdr = mkConstant('PlatformBootManager.h', 'MdeModulePkg/Include/Library/PlatformBootManager.h', 'MdeModulePkg/Include/Library/PlatformBootManager.h', 1);
+    shellHdr.kind = 'file';
+    mdeHdr.kind = 'file';
+    const ctx = {
+      ...baseContext(),
+      fileExists: () => false,
+      getNodesByKind: (k: string) => (k === 'file' ? [mdeHdr, shellHdr] : []),
+      getNodesInFile: (p: string) =>
+        p === 'ShellPkg/Include/Library/PlatformBootManager.h' ? [shellHdr] : p === 'MdeModulePkg/Include/Library/PlatformBootManager.h' ? [mdeHdr] : [],
+    };
+    const ref: UnresolvedRef = {
+      fromNodeId: 'file:ShellPkg/Library/UefiBootManagerLib/InternalBm.c',
+      referenceName: 'Library/PlatformBootManager.h',
+      referenceKind: 'imports',
+      line: 1,
+      column: 10,
+      filePath: 'ShellPkg/Library/UefiBootManagerLib/InternalBm.c',
+      language: 'c',
+    };
+    const result = edk2Resolver.resolve(ref, ctx as never);
+    expect(result?.targetNodeId).toBe(shellHdr.id);
+  });
+
+  it('excludes BaseTools vendored headers from the include index', () => {
+    const btHdr = mkConstant('DevicePath.h', 'BaseTools/Source/C/Include/Protocol/DevicePath.h', 'BaseTools/Source/C/Include/Protocol/DevicePath.h', 1);
+    const mdeHdr = mkConstant('DevicePath.h', 'MdePkg/Include/Protocol/DevicePath.h', 'MdePkg/Include/Protocol/DevicePath.h', 1);
+    btHdr.kind = 'file';
+    mdeHdr.kind = 'file';
+    const ctx = {
+      ...baseContext(),
+      fileExists: () => false,
+      getNodesByKind: (k: string) => (k === 'file' ? [btHdr, mdeHdr] : []),
+      getNodesInFile: (p: string) => (p === 'MdePkg/Include/Protocol/DevicePath.h' ? [mdeHdr] : []),
+    };
+    const ref: UnresolvedRef = {
+      fromNodeId: 'file:ShellPkg/Shell.c',
+      referenceName: 'Protocol/DevicePath.h',
+      referenceKind: 'imports',
+      line: 1,
+      column: 10,
+      filePath: 'ShellPkg/Shell.c',
+      language: 'c',
+    };
+    const result = edk2Resolver.resolve(ref, ctx as never);
+    expect(result?.targetNodeId).toBe(mdeHdr.id);
+  });
+
+  it('prefers the same-directory UNI constant for STRING_TOKEN refs', () => {
+    const local = mkConstant('STR_MODULE_ABSTRACT', 'Pkg/Drv/Drv.uni::STR_MODULE_ABSTRACT', 'Pkg/Drv/Drv.uni', 3);
+    const other = mkConstant('STR_MODULE_ABSTRACT', 'Pkg/Other/Other.uni::STR_MODULE_ABSTRACT', 'Pkg/Other/Other.uni', 3);
+    const ctx = {
+      ...baseContext(),
+      getNodesByName: (n: string) => (n === 'STR_MODULE_ABSTRACT' ? [other, local] : []),
+    };
+    const ref: UnresolvedRef = {
+      fromNodeId: 'file:Pkg/Drv/Drv.c',
+      referenceName: 'STR_MODULE_ABSTRACT',
+      referenceKind: 'references',
+      line: 5,
+      column: 20,
+      filePath: 'Pkg/Drv/Drv.c',
+      language: 'c',
+    };
+    const result = edk2Resolver.resolve(ref, ctx as never);
+    expect(result?.targetNodeId).toBe(local.id);
+  });
+
+  it('expands $(FSP_PACKAGE)/… macro paths before resolving', () => {
+    const target = mkModuleNode('IntelFsp2Pkg/Core/X.inf', 1, 'X');
+    const ctx = {
+      ...baseContext(),
+      fileExists: (p: string) => p === 'IntelFsp2Pkg/Core/X.inf',
+      getNodesInFile: (p: string) => (p === 'IntelFsp2Pkg/Core/X.inf' ? [target] : []),
+    };
+    const ref: UnresolvedRef = {
+      fromNodeId: 'file:Test.dsc',
+      referenceName: '$(FSP_PACKAGE)/Core/X.inf',
+      referenceKind: 'imports',
+      line: 1,
+      column: 0,
+      filePath: 'Test.dsc',
+      language: 'edk2',
+    };
+    const result = edk2Resolver.resolve(ref, ctx as never);
+    expect(result?.targetNodeId).toBe(target.id);
+  });
+});

@@ -50,7 +50,7 @@ const GUID_USAGE_RE = /\b(g(?:Efi|Edkii)[A-Za-z0-9_]*(?:ProtocolGuid|PpiGuid|Gui
 // as a constant in a `.uni` file (same simple-name contract as PCD/GUID).
 const STRING_TOKEN_RE = /\bSTRING_TOKEN\s*\(\s*([A-Za-z0-9_]+)\s*\)/g;
 
-const DESCRIPTOR_EXT = /\.(dec|inf|dsc|fdf)(?:\.inc)?$/i;
+const DESCRIPTOR_EXT = /\.(dec|inf|dsc|fdf|uni)(?:\.inc)?$/i;
 const SOURCE_EXT = /\.(c|cc|cpp)$/i;
 
 /**
@@ -64,6 +64,9 @@ const includeIndex = new WeakMap<ResolutionContext, Map<string, string[]>>();
 function buildIncludeIndex(context: ResolutionContext): Map<string, string[]> {
   const index = new Map<string, string[]>();
   for (const n of context.getNodesByKind('file')) {
+    // BaseTools/Source/C/Include vendored build-tool headers shadow the MdePkg
+    // canon for names like `Protocol/DevicePath.h` — never let them win.
+    if (n.filePath.startsWith('BaseTools/')) continue;
     const m = /\/Include\/(.+)$/.exec(n.filePath);
     if (m) {
       const arr = index.get(m[1]!);
@@ -125,7 +128,13 @@ export const edk2Resolver: FrameworkResolver = {
     // `[Includes]` dir); quoted includes resolve via the normal import resolver
     // (root-relative fileExists fails here → null → no duplicate edge).
     if (DESCRIPTOR_EXT.test(name) || name.includes('/') || name.endsWith('.h')) {
-      let cand = context.fileExists(name) ? name : null;
+      // `$(FSP_PACKAGE)/…` / `$(PLATFORM_PACKAGE)/…` workspace macros (DSC
+      // components, FDF INF lines) — expand the two EDK2-known ones.
+      const expanded = name.replace(
+        /^\$\((FSP_PACKAGE|PLATFORM_PACKAGE)\)\//,
+        (_, k: string) => (k === 'FSP_PACKAGE' ? 'IntelFsp2Pkg/' : 'PrmPkg/')
+      );
+      let cand = context.fileExists(expanded) ? expanded : null;
       if (!cand && name.endsWith('.h')) {
         // `<pkg>/Include/<name>` layout fallback (see buildIncludeIndex).
         let index = includeIndex.get(context);
@@ -134,7 +143,12 @@ export const edk2Resolver: FrameworkResolver = {
           includeIndex.set(context, index);
         }
         const hits = index.get(name);
-        if (hits && hits.length > 0) cand = hits[0]!;
+        if (hits && hits.length > 0) {
+          // Prefer the candidate from the including file's own package
+          // (ShellPkg code must get ShellPkg's header, not MdeModulePkg's).
+          const refPkg = ref.filePath?.split('/')[0];
+          cand = (refPkg && hits.find((h) => h.startsWith(refPkg + '/'))) ?? hits[0]!;
+        }
       }
       if (!cand) return null;
       const inFile = context.getNodesInFile(cand);
@@ -157,12 +171,20 @@ export const edk2Resolver: FrameworkResolver = {
       }
     }
 
-    // GUID / PCD / library-class by simple name → DEC constant.
+    // GUID / PCD / library-class by simple name → DEC constant. STRING_TOKEN
+    // names (STR_MODULE_ABSTRACT etc.) are declared in every module's own
+    // .uni — prefer the constant in the referencing file's directory before
+    // falling back to the first declaration.
     const hits = context
       .getNodesByName(name)
       .filter((n) => n.kind === 'constant' && n.language === 'edk2');
     if (hits.length > 0) {
-      return { original: ref, targetNodeId: hits[0]!.id, confidence: 0.9, resolvedBy: 'framework' };
+      const refDir = ref.filePath ? path.dirname(ref.filePath) : '';
+      const local = refDir
+        ? hits.find((n) => path.dirname(n.filePath) === refDir)
+        : undefined;
+      const target = local ?? hits[0]!;
+      return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'framework' };
     }
 
     return null;

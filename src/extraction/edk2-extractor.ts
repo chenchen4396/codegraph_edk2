@@ -193,9 +193,13 @@ export class Edk2Extractor {
       }
       const hdr = trimmed.match(/^\[([^\]]+)\]$/);
       if (hdr) {
+        // EDK2 sections carry arch/modifier segments: `[LibraryClasses.common.PEIM]`,
+        // `[Depex.common.DXE_DRIVER]`, `[PcdsFixedAtBuild.X64]`. Strip ALL
+        // dotted segments (the old one-shot strip left `LibraryClasses.common`
+        // unmatched); comma lists (`[Sources.Ia32, Sources.X64]`) split first.
         const bases = hdr[1]!
           .split(',')
-          .map((t) => t.trim().replace(/\.[A-Za-z0-9_]+$/, '')) // strip .ARCH
+          .map((t) => t.trim().replace(/\.[A-Za-z0-9_]+/g, ''))
           .filter((t) => t.length > 0);
         current = bases.map((b) => ({ name: b, lines: [] }));
         if (sections.length === 0) {
@@ -223,19 +227,28 @@ export class Edk2Extractor {
     const defines = new Map<string, string>();
     const sources: string[] = []; // project-relative .c/.cc source paths
     const sourceFiles: { rel: string; line: number }[] = []; // every [Sources] entry
+    let moduleUni: { value: string; line: number } | null = null;
     let moduleLine = 1;
 
     for (const sec of sections) {
       if (sec.name === 'Defines') {
-        for (const { text } of sec.lines) {
+        for (const { text, line } of sec.lines) {
           const m = text.match(/^([A-Za-z0-9_]+)\s*=\s*(.*)$/);
-          if (m) defines.set(m[1]!, m[2]!.trim());
+          if (m) {
+            defines.set(m[1]!, m[2]!.trim());
+            if (m[1] === 'MODULE_UNI_FILE' && m[2]!.trim()) {
+              moduleUni = { value: m[2]!.trim(), line };
+            }
+          }
         }
       } else if (sec.name === 'Sources') {
         for (const { text, line } of sec.lines) {
-          const sp = text.split(/\s+/)[0]!;
+          // `foo.nasm| INTEL` — a toolcode attached without a separating space.
+          const sp = text.split(/\s+/)[0]!.replace(/\|.*$/, '').trim();
           if (/\.(c|cc|cpp)$/i.test(sp)) sources.push(this.rel(sp));
-          if (/\.(c|cc|cpp|asm|nasm|s|asl|aslc)$/i.test(sp)) sourceFiles.push({ rel: this.rel(sp), line });
+          if (/\.(c|cc|cpp|asm|nasm|nasmb|s|asl|aslc|h|uni)$/i.test(sp)) {
+            sourceFiles.push({ rel: this.rel(sp), line });
+          }
         }
       }
     }
@@ -334,6 +347,8 @@ export class Edk2Extractor {
     for (const { rel, line } of sourceFiles) {
       this.emitRef(from, rel, 'imports', line);
     }
+    // Module → its HII strings file (MODULE_UNI_FILE, 593 INFs in the corpus).
+    if (moduleUni) this.emitRef(from, this.rel(moduleUni.value), 'imports', moduleUni.line);
 
     // ENTRY_POINT / UNLOAD_IMAGE / CONSTRUCTOR → C function (candidates = the
     // module's [Sources] .c paths so the resolver scopes the function lookup).
@@ -360,11 +375,17 @@ export class Edk2Extractor {
   private parseDec(): void {
     const sections = Edk2Extractor.splitSections(this.source);
     const defines = new Map<string, string>();
+    let pkgUni: { value: string; line: number } | null = null;
     for (const sec of sections) {
       if (sec.name !== 'Defines') continue;
-      for (const { text } of sec.lines) {
+      for (const { text, line } of sec.lines) {
         const m = text.match(/^([A-Za-z0-9_]+)\s*=\s*(.*)$/);
-        if (m) defines.set(m[1]!, m[2]!.trim());
+        if (m) {
+          defines.set(m[1]!, m[2]!.trim());
+          if (m[1] === 'PACKAGE_UNI_FILE' && m[2]!.trim()) {
+            pkgUni = { value: m[2]!.trim(), line };
+          }
+        }
       }
     }
     const pkg = defines.get('PACKAGE_NAME');
@@ -387,6 +408,9 @@ export class Edk2Extractor {
       endColumn: 0,
       updatedAt: this.now,
     });
+
+    // Package → its HII strings file (PACKAGE_UNI_FILE, 13 DECs in the corpus).
+    if (pkgUni) this.emitRef(moduleNodeId, this.rel(pkgUni.value), 'imports', pkgUni.line);
 
     for (const sec of sections) {
       if (sec.name === 'LibraryClasses') {
@@ -646,31 +670,63 @@ export class Edk2Extractor {
   private parseUni(): void {
     // Strip `//` line comments.
     const lines = this.source.split('\n');
-    const re = /^\s*#string\s+([A-Za-z0-9_]+)\s+#language\s+\S+\s+"(.*)"\s*$/;
     const seen = new Set<string>();
+    // `#string STR_X` may split across lines: `#string STR_X` / `#language
+    // en-US` / `"value"` (the *Extra.uni family — 254 tokens in the corpus).
+    let pending: { token: string; line: number; lang: boolean } | null = null;
+    const emit = (token: string, value: string, line: number) => {
+      if (seen.has(token)) return;
+      seen.add(token);
+      this.addNode({
+        id: generateNodeId(this.filePath, 'constant', token, line),
+        kind: 'constant',
+        name: token,
+        qualifiedName: `${this.filePath}::${token}`,
+        filePath: this.filePath,
+        language: 'edk2',
+        startLine: line,
+        endLine: line,
+        startColumn: 0,
+        endColumn: 0,
+        docstring: value,
+        updatedAt: this.now,
+      });
+    };
     for (let i = 0; i < lines.length; i++) {
       const raw = lines[i]!;
       if (raw.trim().startsWith('//')) continue;
-      const m = raw.match(re);
+      // Combined form: `#string STR_X #language en-US "value"`.
+      const m = raw.match(/^\s*#string\s+([A-Za-z0-9_]+)\s+#language\s+\S+\s+"(.*)"\s*$/);
       if (m) {
-        const token = m[1]!;
-        const value = m[2]!;
-        if (seen.has(token)) continue;
-        seen.add(token);
-        this.addNode({
-          id: generateNodeId(this.filePath, 'constant', token, i + 1),
-          kind: 'constant',
-          name: token,
-          qualifiedName: `${this.filePath}::${token}`,
-          filePath: this.filePath,
-          language: 'edk2',
-          startLine: i + 1,
-          endLine: i + 1,
-          startColumn: 0,
-          endColumn: 0,
-          docstring: value,
-          updatedAt: this.now,
-        });
+        emit(m[1]!, m[2]!, i + 1);
+        pending = null;
+        continue;
+      }
+      // Split form part 1: `#string STR_X`.
+      const s = raw.match(/^\s*#string\s+([A-Za-z0-9_]+)\s*$/);
+      if (s) {
+        pending = { token: s[1]!, line: i + 1, lang: false };
+        continue;
+      }
+      if (!pending) continue;
+      // Split form part 2: `#language en-US "value"` (one line)…
+      const l = raw.match(/^\s*#language\s+\S+\s+"(.*)"\s*$/);
+      if (l) {
+        emit(pending.token, l[1]!, pending.line);
+        pending = null;
+        continue;
+      }
+      // …or `#language en-US` alone, value on the NEXT line.
+      if (!pending.lang && /^\s*#language\s+\S+\s*$/.test(raw)) {
+        pending.lang = true;
+        continue;
+      }
+      if (pending.lang) {
+        const v = raw.match(/^\s*"(.*)"\s*$/);
+        if (v) {
+          emit(pending.token, v[1]!, pending.line);
+          pending = null;
+        }
       }
     }
   }

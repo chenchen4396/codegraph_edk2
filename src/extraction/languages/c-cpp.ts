@@ -568,6 +568,11 @@ export function blankLoneMacroLines(source: string): string {
     if (next < lines.length) {
       const first = content(lines[next] as string)[0];
       if (!first || !/[A-Za-z_#{}~]/.test(first)) continue;
+      // A lone ALL-CAPS line directly above `Name (` is a return type (EDK2
+      // style: `EFI_STATUS` on its own line before the entry point) — blanking
+      // it destroys the function definition. Only actual macro-annotation
+      // lines (followed by a typed declaration) are safe to blank.
+      if (/^[A-Za-z_][A-Za-z0-9_]*\s*\(/.test(content(lines[next] as string))) continue;
     }
     const start = line.indexOf(m[1] as string);
     lines[i] =

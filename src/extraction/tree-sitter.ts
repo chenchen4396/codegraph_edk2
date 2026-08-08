@@ -113,7 +113,14 @@ function extractNameRaw(node: SyntaxNode, source: string, extractor: LanguageExt
     // pointer_declarator exposes its inner through a `declarator` field; a
     // reference_declarator has none, so it's reached via namedChild(0).
     let resolved = nameNode;
-    while (resolved.type === 'pointer_declarator' || resolved.type === 'reference_declarator') {
+    while (
+      resolved.type === 'pointer_declarator' ||
+      resolved.type === 'reference_declarator' ||
+      // `typedef EFI_STATUS (EFIAPI *EFI_GET_TIME)(…)` — UEFI function-pointer
+      // typedefs wrap the pointer in parens; peel them so the name is
+      // `EFI_GET_TIME`, not the literal `(EFIAPI *EFI_GET_TIME)` declarator.
+      resolved.type === 'parenthesized_declarator'
+    ) {
       const inner = getChildByField(resolved, 'declarator') || resolved.namedChild(0);
       if (!inner) break;
       resolved = inner;
@@ -129,7 +136,19 @@ function extractNameRaw(node: SyntaxNode, source: string, extractor: LanguageExt
     }
     // Handle complex declarators (C/C++)
     if (resolved.type === 'function_declarator' || resolved.type === 'declarator') {
-      const innerName = getChildByField(resolved, 'declarator') || resolved.namedChild(0);
+      let innerName = getChildByField(resolved, 'declarator') || resolved.namedChild(0);
+      // Function-pointer typedefs: `(*NAME)(…)` / `(EFIAPI *NAME)(…)` — the
+      // declarator inside the parens is the real name, not the paren text.
+      while (
+        innerName &&
+        (innerName.type === 'parenthesized_declarator' ||
+          innerName.type === 'pointer_declarator' ||
+          innerName.type === 'reference_declarator')
+      ) {
+        const next = getChildByField(innerName, 'declarator') || innerName.namedChild(0);
+        if (!next) break;
+        innerName = next;
+      }
       return innerName ? getNodeText(innerName, source) : getNodeText(resolved, source);
     }
     // Lua: `function t.f()` / `function t:m()` — the name node is a dot/method
