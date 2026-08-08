@@ -187,8 +187,11 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.s': 'assembly',
   // ACPI: `.asl` is ACPI Source Language (custom AslExtractor — DefinitionBlock
   // / Device / Method); `.aslc` is plain C embedding the compiled table bytes
-  // (structs + #include <IndustryStandard/Acpi.h>) — it IS C.
+  // (structs + #include <IndustryStandard/Acpi.h>) — it IS C. `.asi` is an
+  // ASL Include fragment (spliced into .asl via `Include ("X.asi")` /
+  // `#include "X.asi"`) — same language, file-node only (no DefinitionBlock).
   '.asl': 'asl',
+  '.asi': 'asl',
   '.aslc': 'c',
 };
 

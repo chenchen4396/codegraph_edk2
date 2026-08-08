@@ -6946,6 +6946,38 @@ describe('Directory Exclusion', () => {
     expect(files[0]).toBe('src/components/Button.tsx');
     expect(files[0]).not.toContain('\\');
   });
+
+  it('should NOT default-ignore BaseTools/Source/Python/build in an EDK2 workspace', () => {
+    // Every EDK2 tree ships the build system's SOURCE at
+    // `BaseTools/Source/Python/build/` (build.py, BuildReport.py). The generic
+    // `build/` default-ignore (gitignore semantics match any depth) would
+    // silently drop it — and so would the tree's own `Build/` output rule,
+    // because the ignore matcher is case-insensitive. The EDK2 carve-out
+    // negates the defaults for BaseTools/ when the workspace markers are
+    // present.
+    fs.mkdirSync(path.join(tempDir, 'BaseTools', 'Source', 'Python', 'build'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'BaseTools', 'Source', 'Python', 'build', 'build.py'), 'print("build tool")\n');
+    fs.writeFileSync(path.join(tempDir, 'edksetup.sh'), '#!/bin/sh\n');
+    // The real edk2 .gitignore ignores its BUILD OUTPUT dir with `Build/` —
+    // the case-insensitive matcher would otherwise swallow the lowercase
+    // source dir too.
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), 'Build/\n');
+
+    const ig = buildDefaultIgnore(tempDir);
+    expect(ig.ignores('BaseTools/Source/Python/build/build.py')).toBe(false);
+    // A generic lowercase build/ output dir elsewhere in the same workspace is
+    // still default-ignored.
+    expect(ig.ignores('SomePkg/build/gen.c')).toBe(true);
+  });
+
+  it('should keep the generic build/ default-ignore in non-EDK2 workspaces', () => {
+    fs.mkdirSync(path.join(tempDir, 'app', 'build'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'app', 'build', 'gen.c'), 'int x;\n');
+    fs.writeFileSync(path.join(tempDir, 'app', 'src.ts'), 'export const a = 1;');
+
+    const ig = buildDefaultIgnore(tempDir);
+    expect(ig.ignores('app/build/gen.c')).toBe(true);
+  });
 });
 
 describe('Git Submodules', () => {

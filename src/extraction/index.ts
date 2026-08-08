@@ -309,10 +309,29 @@ function readGitignorePatterns(giPath: string): string {
  * it project code; the explicit `.gitignore` negation is the only opt-in).
  */
 export function buildDefaultIgnore(rootDir: string): Ignore {
-  const ig = ignore().add(DEFAULT_IGNORE_PATTERNS);
+  const patterns = [...DEFAULT_IGNORE_PATTERNS];
+  const ig = ignore().add(patterns);
   const rootGitignore = path.join(rootDir, '.gitignore');
   if (fs.existsSync(rootGitignore)) ig.add(readGitignorePatterns(rootGitignore));
+  // EDK2 workspace carve-out: every EDK2 tree ships its build-system source
+  // at `BaseTools/Source/Python/build/` — canonical first-party source, not
+  // build output. The generic `build/` default-ignore (gitignore semantics
+  // match any depth) would silently drop the EDK2 build tool itself
+  // (build.py, BuildReport.py); so does the tree's own `Build/` output rule,
+  // because the `ignore` matcher is case-insensitive. Negate for BaseTools —
+  // added LAST so it beats both the defaults and the merged .gitignore.
+  if (isEdk2Workspace(rootDir)) ig.add('!BaseTools/**');
   return ig;
+}
+
+/** EDK2 workspace detection: `BaseTools/` + an `edksetup` script at the root
+ * (the layout every TianoCore checkout has, and nothing else commonly does). */
+function isEdk2Workspace(rootDir: string): boolean {
+  return (
+    fs.existsSync(path.join(rootDir, 'BaseTools')) &&
+    (fs.existsSync(path.join(rootDir, 'edksetup.sh')) ||
+      fs.existsSync(path.join(rootDir, 'edksetup.bat')))
+  );
 }
 
 /**

@@ -45,6 +45,27 @@ export class AslExtractor {
 
   extract(): ExtractionResult {
     const start = Date.now();
+    // Cross-file refs: IASL preprocesses with cpp, so ASL sources pull shared
+    // table fragments with BOTH `Include ("X.asi")` (IASL form) and
+    // `#include "X.asi"` (cpp form — ManageabilityPkg's BmcSsdt.asl includes
+    // IpmiOprRegions.asi). The .asi fragments are indexed as asl-language
+    // file nodes; these refs give the table → fragment edge.
+    const unresolvedReferences: ExtractionResult['unresolvedReferences'] = [];
+    const includeRe = /^\s*(?:#\s*include|Include)\s*\(?\s*["<]([^">]+)[">]/gim;
+    let incM: RegExpExecArray | null;
+    while ((incM = includeRe.exec(this.source)) !== null) {
+      const incLine = this.source.slice(0, incM.index).split('\n').length;
+      unresolvedReferences.push({
+        fromNodeId: this.fileNodeId,
+        referenceName: this.rel(incM[1]!),
+        referenceKind: 'imports',
+        line: incLine,
+        column: 0,
+        filePath: this.filePath,
+        language: 'asl',
+      });
+    }
+
     try {
       if (this.ext === '.asl') this.parseDefinitionBlock();
     } catch (err) {
@@ -62,7 +83,7 @@ export class AslExtractor {
     return {
       nodes: this.nodes,
       edges: this.edges,
-      unresolvedReferences: [],
+      unresolvedReferences,
       errors: this.errors,
       durationMs: Date.now() - start,
     };
@@ -157,5 +178,12 @@ export class AslExtractor {
   private dirOf(): string {
     const d = path.dirname(this.filePath);
     return d === '.' ? '' : d;
+  }
+
+  /** Resolve a path relative to this file's directory to project-relative
+   * forward-slash form. */
+  private rel(p: string): string {
+    const joined = this.dirOf() ? path.posix.join(this.dirOf(), p) : p;
+    return joined.replace(/\\/g, '/');
   }
 }

@@ -386,9 +386,11 @@ export class Edk2Extractor {
     // Module → its HII strings file (MODULE_UNI_FILE, 593 INFs in the corpus).
     if (moduleUni) this.emitRef(from, this.rel(moduleUni.value), 'imports', moduleUni.line);
 
-    // ENTRY_POINT / UNLOAD_IMAGE / CONSTRUCTOR → C function (candidates = the
-    // module's [Sources] .c paths so the resolver scopes the function lookup).
-    for (const key of ['ENTRY_POINT', 'UNLOAD_IMAGE', 'CONSTRUCTOR']) {
+    // ENTRY_POINT / UNLOAD_IMAGE / CONSTRUCTOR / DESTRUCTOR → C function
+    // (candidates = the module's [Sources] .c paths so the resolver scopes the
+    // function lookup). DESTRUCTOR is in the EDK2 INF spec and used by 82 INFs
+    // in the reference corpus (SmmLockBox, DxeDebugPrintErrorLevelLib, …).
+    for (const key of ['ENTRY_POINT', 'UNLOAD_IMAGE', 'CONSTRUCTOR', 'DESTRUCTOR']) {
       const v = defines.get(key);
       if (v && /^[A-Za-z_][A-Za-z0-9_]*$/.test(v)) {
         const defLine = this.findDefinesLine(key) || moduleLine;

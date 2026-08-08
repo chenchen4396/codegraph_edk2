@@ -463,6 +463,36 @@ describe('Edk2Extractor — ASL / aslc / nasm.inc routing', () => {
     expect(detectLanguage('OvmfPkg/Bhyve/AcpiTables/Facp.aslc')).toBe('c');
     expect(detectLanguage('OvmfPkg/ResetVector/X64/PageTables64.nasm.inc')).toBe('assembly');
     expect(detectLanguage('NetworkPkg/NetworkLibs.dsc.inc')).toBe('edk2');
+    // ASL Include fragments (.asi) are spliced into .asl via
+    // Include ("X.asi") / #include "X.asi" (ManageabilityPkg BmcSsdt pattern).
+    expect(detectLanguage('ManageabilityPkg/Universal/IpmiBmcAcpi/BmcSsdt/IpmiOprRegions.asi')).toBe('asl');
+  });
+
+  it('emits Include ("X.asi") and #include "X.asi" imports from ASL', () => {
+    const src = `/** @file
+  BMC SSDT.
+**/
+#include "IpmiOprRegions.asi"
+DefinitionBlock (
+  "BmcSsdt.aml",
+  "SSDT",
+  2,
+  "INTEL ",
+  "BMC",
+  0x00000001
+) {
+  Include ("CommonOprRegions.asi")
+}
+`;
+    const result = extractFromSource(
+      'ManageabilityPkg/Universal/IpmiBmcAcpi/BmcSsdt/BmcSsdt.asl',
+      src,
+      'asl'
+    );
+    const names = result.unresolvedReferences.map((r) => r.referenceName);
+    expect(names).toContain('ManageabilityPkg/Universal/IpmiBmcAcpi/BmcSsdt/IpmiOprRegions.asi');
+    expect(names).toContain('ManageabilityPkg/Universal/IpmiBmcAcpi/BmcSsdt/CommonOprRegions.asi');
+    expect(result.unresolvedReferences.every((r) => r.referenceKind === 'imports')).toBe(true);
   });
 
   it('parses a DefinitionBlock into a module node + Device/Method constants', () => {
@@ -669,6 +699,8 @@ describe('Edk2Extractor — Round 4: EDK2-architecture audit fixes', () => {
   BASE_NAME   = MockTpmMeasurementlib
   MODULE_TYPE = HOST_APPLICATION
   LIBRARY_CLASS = TpmMeasurementlib
+  CONSTRUCTOR = MockLibConstructor
+  DESTRUCTOR  = MockLibDestructor
 
 [sources]
   MockTpmMeasurementLib.cpp
@@ -702,6 +734,10 @@ describe('Edk2Extractor — Round 4: EDK2-architecture audit fixes', () => {
     // (PCD refs carry the token-space-qualified name as the candidate).
     expect(names).toContain('gEfiOtherGuid');
     expect(names).toContain('PcdFixedThing');
+    // CONSTRUCTOR + DESTRUCTOR → function refs (82 corpus INFs use
+    // DESTRUCTOR — SmmLockBox, DxeDebugPrintErrorLevelLib, …).
+    expect(names).toContain('MockLibConstructor');
+    expect(names).toContain('MockLibDestructor');
     const fixedPcd = result.unresolvedReferences.find((r) => r.referenceName === 'PcdFixedThing');
     expect(fixedPcd!.candidates).toContain('gEfiMdeModulePkgTokenSpaceGuid.PcdFixedThing');
   });
