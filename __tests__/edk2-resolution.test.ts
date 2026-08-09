@@ -966,4 +966,30 @@ describe('edk2Resolver — library-call bridge (unit)', () => {
     expect(result).not.toBeNull();
     expect(result!.confidence).toBeGreaterThanOrEqual(0.9);
   });
+
+  it('expands $(DEFINE) macros in instance [Sources] paths', () => {
+    const ctx = libCtx();
+    const baseRead = ctx.readFile.bind(ctx);
+    const baseGetInFile = ctx.getNodesInFile.bind(ctx);
+    (ctx as unknown as { readFile: (p: string) => string | null }).readFile = (p: string) => {
+      if (p === 'TestPkg/Library/TestLib/TestLib.inf') {
+        return '[Defines]\n  BASE_NAME = TestLib\n  LIBRARY_CLASS = TestLib\n  MODULE_TYPE = BASE\n  DEFINE SRC_DIR = src\n\n[Sources]\n  $(SRC_DIR)/TestLib.c\n';
+      }
+      return baseRead(p);
+    };
+    (ctx as unknown as { getNodesInFile: (p: string) => unknown[] }).getNodesInFile = (p: string) =>
+      p === 'TestPkg/Library/TestLib/src/TestLib.c' ? baseGetInFile('TestPkg/Library/TestLib/TestLib.c') : baseGetInFile(p);
+    const ref: UnresolvedRef = {
+      fromNodeId: 'function:caller7',
+      referenceName: 'FetchValue',
+      referenceKind: 'calls',
+      line: 4,
+      column: 12,
+      filePath: 'TestPkg/Drv/Drv.c',
+      language: 'c',
+    };
+    const result = edk2Resolver.resolve(ref, ctx as never);
+    expect(result).not.toBeNull();
+    expect(result!.confidence).toBeGreaterThanOrEqual(0.9);
+  });
 });
