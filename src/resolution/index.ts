@@ -11,6 +11,7 @@ import { QueryBuilder } from '../db/queries';
 import {
   UnresolvedRef,
   ResolvedRef,
+  RefusedRef,
   ResolutionResult,
   ResolutionContext,
   FrameworkResolver,
@@ -703,6 +704,7 @@ export class ReferenceResolver {
 
     const resolved: ResolvedRef[] = [];
     const unresolved: UnresolvedRef[] = [];
+    const refused: UnresolvedRef[] = [];
     const byMethod: Record<string, number> = {};
 
     // Convert to our internal format, using denormalized fields when available
@@ -725,11 +727,13 @@ export class ReferenceResolver {
       const ref = refs[i]!; // Array index is guaranteed to be in bounds
       const result = this.resolveOneTimed(ref);
 
-      if (result) {
+      if (result === null) {
+        unresolved.push(ref);
+      } else if ('refused' in result) {
+        refused.push(ref);
+      } else {
         resolved.push(result);
         byMethod[result.resolvedBy] = (byMethod[result.resolvedBy] || 0) + 1;
-      } else {
-        unresolved.push(ref);
       }
 
       // Report progress every 1% to avoid too many updates
@@ -750,6 +754,7 @@ export class ReferenceResolver {
     return {
       resolved,
       unresolved,
+      refused,
       stats: {
         total: refs.length,
         resolved: resolved.length,
@@ -851,9 +856,11 @@ export class ReferenceResolver {
   }
 
   /**
-   * Resolve a single reference
+   * Resolve a single reference. Returns a ResolvedRef (edge), a RefusedRef
+   * (framework declares the ref invalid — dropped from the unresolved set),
+   * or null (no strategy claimed it; stays unresolved).
    */
-  resolveOne(ref: UnresolvedRef): ResolvedRef | null {
+  resolveOne(ref: UnresolvedRef): ResolvedRef | RefusedRef | null {
     // Skip built-in/external references
     if (this.isBuiltInOrExternal(ref)) {
       return null;
@@ -955,18 +962,21 @@ export class ReferenceResolver {
     // are deliberately preserved (Drupal `routing.yml` → PHP controller, RN
     // JS → native `calls`) — `gateFrameworkLanguage` only drops a type/import
     // edge between two KNOWN families (see its doc), never a `calls` bridge or
-    // a config↔code edge.
+    // a config↔code edge. A framework may also REFUSE a ref (`RefusedRef`):
+    // the name matches its candidate shape but is not declared in its
+    // authoritative sections — the ref is invalid, so no other strategy may
+    // claim it and it is dropped from the unresolved set entirely.
     const tFw = this.profileStages ? process.hrtime.bigint() : 0n;
     let fwEarly: ResolvedRef | null = null;
     for (const framework of this.frameworks) {
       const result = this.gateFrameworkLanguage(framework.resolve(ref, this.context), ref);
-      if (result) {
-        if (result.confidence >= 0.9) {
-          fwEarly = result; // High confidence, return immediately (below)
-          break;
-        }
-        candidates.push(result);
+      if (!result) continue;
+      if ('refused' in result) return result;
+      if (result.confidence >= 0.9) {
+        fwEarly = result; // High confidence, return immediately (below)
+        break;
       }
+      candidates.push(result);
     }
     if (this.profileStages) this.stageAdd('frameworks', ref, fwEarly !== null, tFw);
     if (fwEarly) return fwEarly;
@@ -1196,6 +1206,18 @@ export class ReferenceResolver {
       this.queries.deleteSpecificResolvedReferences(legacyKeys);
     }
 
+    // Refused refs are deleted outright — a framework declared them invalid
+    // (candidate shape, but no declaration in its authoritative sections), so
+    // a later file gaining the name can never make them valid; failed status
+    // would keep them parked forever and inflate unresolved counts.
+    if (result.refused && result.refused.length > 0) {
+      const { rowIds, legacyKeys } = ReferenceResolver.partitionResolvedCleanup(
+        result.refused.map((r) => ({ original: r, targetNodeId: '', confidence: 0, resolvedBy: 'framework' as const }))
+      );
+      this.queries.deleteReferencesByRowIds(rowIds);
+      this.queries.deleteSpecificResolvedReferences(legacyKeys);
+    }
+
     // Park unresolvable refs as status='failed' — parity with
     // resolveAndPersistBatched. Deleting them was wrong (#1240): a ref whose
     // own file never changes is otherwise gone forever, so when a DIFFERENT
@@ -1252,6 +1274,21 @@ export class ReferenceResolver {
     for (let i = 0; i < failedCleanup.legacyKeys.length; i += PERSIST_CHUNK) {
       this.queries.markReferencesFailed(failedCleanup.legacyKeys.slice(i, i + PERSIST_CHUNK));
       await maybeYield();
+    }
+
+    // Refused: delete the rows outright (invalid refs can never become valid).
+    if (result.refused && result.refused.length > 0) {
+      const refusedCleanup = ReferenceResolver.partitionResolvedCleanup(
+        result.refused.map((r) => ({ original: r, targetNodeId: '', confidence: 0, resolvedBy: 'framework' as const }))
+      );
+      for (let i = 0; i < refusedCleanup.rowIds.length; i += PERSIST_CHUNK) {
+        this.queries.deleteReferencesByRowIds(refusedCleanup.rowIds.slice(i, i + PERSIST_CHUNK));
+        await maybeYield();
+      }
+      for (let i = 0; i < refusedCleanup.legacyKeys.length; i += PERSIST_CHUNK) {
+        this.queries.deleteSpecificResolvedReferences(refusedCleanup.legacyKeys.slice(i, i + PERSIST_CHUNK));
+        await maybeYield();
+      }
     }
 
     return result;
@@ -1330,6 +1367,7 @@ export class ReferenceResolver {
 
     const resolved: ResolvedRef[] = [];
     const unresolved: UnresolvedRef[] = [];
+    const refused: UnresolvedRef[] = [];
     const byMethod: Record<string, number> = {};
 
     for (const raw of batch) {
@@ -1345,11 +1383,13 @@ export class ReferenceResolver {
         rowId: raw.rowId,
       };
       const result = this.resolveOneTimed(ref);
-      if (result) {
+      if (result === null) {
+        unresolved.push(ref);
+      } else if ('refused' in result) {
+        refused.push(ref);
+      } else {
         resolved.push(result);
         byMethod[result.resolvedBy] = (byMethod[result.resolvedBy] || 0) + 1;
-      } else {
-        unresolved.push(ref);
       }
       // Fast-path the per-ref yield check: awaiting the async no-op costs a
       // microtask hop per ref, which dominates at ~10⁵ refs (see MaybeYield).
@@ -1360,6 +1400,7 @@ export class ReferenceResolver {
     return {
       resolved,
       unresolved,
+      refused,
       stats: {
         total: batch.length,
         resolved: resolved.length,
@@ -1410,12 +1451,16 @@ export class ReferenceResolver {
     }
   }
 
-  private resolveOneTimed(ref: UnresolvedRef): ResolvedRef | null {
+  private resolveOneTimed(ref: UnresolvedRef): ResolvedRef | RefusedRef | null {
     if (!this.resolveProfile) return this.resolveOne(ref);
     const t0 = process.hrtime.bigint();
     const result = this.resolveOne(ref);
     const dt = process.hrtime.bigint() - t0;
-    const key = result ? result.resolvedBy : `fail:${ref.referenceKind}`;
+    const key = result
+      ? 'refused' in result
+        ? 'refused:framework'
+        : result.resolvedBy
+      : `fail:${ref.referenceKind}`;
     const slot = this.resolveProfile.get(key);
     if (slot) {
       slot.n++;
@@ -1444,6 +1489,7 @@ export class ReferenceResolver {
   resolveListForAdmission(refs: UnresolvedReference[]): {
     resolved: ResolvedRef[];
     unresolved: UnresolvedRef[];
+    refused: UnresolvedRef[];
     deferredChain: UnresolvedRef[];
     deferredThisMember: UnresolvedRef[];
     byMethod: Record<string, number>;
@@ -1452,6 +1498,7 @@ export class ReferenceResolver {
     this.advanceSupertypeGeneration();
     const resolved: ResolvedRef[] = [];
     const unresolved: UnresolvedRef[] = [];
+    const refused: UnresolvedRef[] = [];
     const byMethod: Record<string, number> = {};
     for (const raw of refs) {
       const ref: UnresolvedRef = {
@@ -1466,16 +1513,19 @@ export class ReferenceResolver {
         rowId: raw.rowId,
       };
       const result = this.resolveOneTimed(ref);
-      if (result) {
+      if (result === null) {
+        unresolved.push(ref);
+      } else if ('refused' in result) {
+        refused.push(ref);
+      } else {
         resolved.push(result);
         byMethod[result.resolvedBy] = (byMethod[result.resolvedBy] || 0) + 1;
-      } else {
-        unresolved.push(ref);
       }
     }
     return {
       resolved,
       unresolved,
+      refused,
       deferredChain: this.deferredChainRefs.splice(0),
       deferredThisMember: this.deferredThisMemberRefs.splice(0),
       byMethod,
@@ -1662,6 +1712,7 @@ export class ReferenceResolver {
           return {
             resolved: settled.out.resolved,
             unresolved: settled.out.unresolved,
+            refused: settled.out.refused,
             stats: {
               total: batch.length,
               resolved: settled.out.resolved.length,
@@ -2436,8 +2487,12 @@ export class ReferenceResolver {
    * Kotlin `class TestRunner`. Gating only the both-known-cross-family case
    * lets config bridges and `calls` bridges through untouched.
    */
-  private gateFrameworkLanguage(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
+  private gateFrameworkLanguage(
+    result: ResolvedRef | RefusedRef | null,
+    ref: UnresolvedRef
+  ): ResolvedRef | RefusedRef | null {
     if (!result) return result;
+    if ('refused' in result) return result;
     if (ref.referenceKind !== 'references' && ref.referenceKind !== 'imports') return result;
     const tgt = this.getLanguageFromNodeId(result.targetNodeId);
     if (tgt && ref.language && crossesKnownFamily(tgt, ref.language)) return null;

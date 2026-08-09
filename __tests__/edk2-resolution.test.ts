@@ -276,9 +276,13 @@ describe('edk2Resolver.claimsReference', () => {
     expect(edk2Resolver.claimsReference('OvmfPkg/ArmVirtRules.fdf.inc')).toBe(true);
     expect(edk2Resolver.claimsReference('Protocol/Arp.h')).toBe(true);
     expect(edk2Resolver.claimsReference('Uefi.h')).toBe(true);
-    // symbol-shaped names are NOT claimed — they pass the pre-filter natively
+    // symbol-shaped names pass the pre-filter natively (no claim needed);
+    // wide GUID-candidate shapes ARE claimed so the resolver's
+    // declaration-set gate can refuse undeclared ones (they'd otherwise die
+    // at the pre-filter before the framework ever sees them).
     expect(edk2Resolver.claimsReference('PcdDebugPropertyMask')).toBe(false);
-    expect(edk2Resolver.claimsReference('gEfiArpProtocolGuid')).toBe(false);
+    expect(edk2Resolver.claimsReference('gEfiArpProtocolGuid')).toBe(true);
+    expect(edk2Resolver.claimsReference('gBS')).toBe(false); // 2-char service globals never candidates
   });
 });
 
@@ -384,6 +388,7 @@ if (Token == STRING_TOKEN (STR_GOP_DUMP_MAIN)) {}
     const ctx = {
       ...baseContext(),
       getNodesByName: (n: string) => (n === 'STR_LI_DUMP_NAME' ? [uniTok] : []),
+      getNodesByKind: (k: string) => (k === 'constant' ? [uniTok] : []),
     };
     const ref: UnresolvedRef = {
       fromNodeId: 'file:Pkg/Drv/Drv.c',
@@ -457,6 +462,7 @@ describe('edk2Resolver — Round 3 audit fixes', () => {
     const ctx = {
       ...baseContext(),
       getNodesByName: (n: string) => (n === 'STR_MODULE_ABSTRACT' ? [other, local] : []),
+      getNodesByKind: (k: string) => (k === 'constant' ? [local, other] : []),
     };
     const ref: UnresolvedRef = {
       fromNodeId: 'file:Pkg/Drv/Drv.c',
@@ -592,6 +598,7 @@ EFI_GUID *GetHob (VOID) {
     const ctx = {
       ...baseContext(),
       getNodesByName: (n: string) => (n === 'gAcpiTableHobGuid' ? [guid] : []),
+      getNodesByKind: (k: string) => (k === 'constant' ? [guid] : []),
     };
     const ref: UnresolvedRef = {
       fromNodeId: 'file:MdeModulePkg/Foo.c',
@@ -677,5 +684,88 @@ TEST_F(Foo, Bar) {
 UINT32 F(VOID) { UINT32 x = 0; return PcdGet32 (x); }`;
     const { references } = edk2Resolver.extract!('MdePkg/F.c', src)!;
     expect(references.some((r) => r.referenceName === 'x')).toBe(false);
+  });
+});
+
+describe('edk2Resolver — declaration-set governance (RefusedRef)', () => {
+  const mkGuidConst = (name: string, file: string) => {
+    const c = mkConstant(name, `${file}::${name}`, file, 1);
+    return c;
+  };
+
+  it('refuses a synthetic GUID ref not declared in any DEC section', () => {
+    const guid = mkGuidConst('gEfiArpProtocolGuid', 'MdePkg/MdePkg.dec');
+    const ctx = {
+      ...baseContext(),
+      getNodesByName: (n: string) => (n === 'gEfiArpProtocolGuid' ? [guid] : []),
+      getNodesByKind: (k: string) => (k === 'constant' ? [guid] : []),
+    };
+    const ref: UnresolvedRef = {
+      fromNodeId: 'file:MdePkg/Foo.c',
+      referenceName: 'gUndeclaredSomethingGuid',
+      referenceKind: 'references',
+      line: 3,
+      column: 10,
+      filePath: 'MdePkg/Foo.c',
+      language: 'c',
+    };
+    const result = edk2Resolver.resolve(ref, ctx as never);
+    expect(result).not.toBeNull();
+    expect((result as { refused?: boolean }).refused).toBe(true);
+  });
+
+  it('resolves a declared GUID with NO Guid suffix (gEfiRngAlgorithmArmRndr shape)', () => {
+    const guid = mkGuidConst('gEfiRngAlgorithmArmRndr', 'MdePkg/MdePkg.dec');
+    const ctx = {
+      ...baseContext(),
+      getNodesByName: (n: string) => (n === 'gEfiRngAlgorithmArmRndr' ? [guid] : []),
+      getNodesByKind: (k: string) => (k === 'constant' ? [guid] : []),
+    };
+    const ref: UnresolvedRef = {
+      fromNodeId: 'file:MdePkg/Rng.c',
+      referenceName: 'gEfiRngAlgorithmArmRndr',
+      referenceKind: 'references',
+      line: 3,
+      column: 10,
+      filePath: 'MdePkg/Rng.c',
+      language: 'c',
+    };
+    const result = edk2Resolver.resolve(ref, ctx as never);
+    expect(result?.targetNodeId).toBe(guid.id);
+  });
+
+  it('refuses a PCD usage whose name is not DEC-declared', () => {
+    const pcd = mkConstant('PcdDebugPropertyMask', 'gEfiMdePkgTokenSpaceGuid.PcdDebugPropertyMask', 'MdePkg/MdePkg.dec', 1);
+    const ctx = {
+      ...baseContext(),
+      getNodesByName: (n: string) => (n === 'PcdDebugPropertyMask' ? [pcd] : []),
+      getNodesByKind: (k: string) => (k === 'constant' ? [pcd] : []),
+    };
+    const ref: UnresolvedRef = {
+      fromNodeId: 'file:MdePkg/Foo.c',
+      referenceName: 'PcdNotDeclaredAnywhere',
+      referenceKind: 'references',
+      line: 3,
+      column: 10,
+      filePath: 'MdePkg/Foo.c',
+      language: 'c',
+      candidates: ['PcdNotDeclaredAnywhere'],
+    };
+    const result = edk2Resolver.resolve(ref, ctx as never);
+    expect((result as { refused?: boolean }).refused).toBe(true);
+  });
+
+  it('leaves non-synthetic refs alone (symbol-node fromNodeId)', () => {
+    const ctx = { ...baseContext(), getNodesByKind: () => [] };
+    const ref: UnresolvedRef = {
+      fromNodeId: 'func:abc123', // a real symbol node, not file:path
+      referenceName: 'gEfiArpProtocolGuid',
+      referenceKind: 'references',
+      line: 3,
+      column: 10,
+      filePath: 'MdePkg/Foo.c',
+      language: 'c',
+    };
+    expect(edk2Resolver.resolve(ref, ctx as never)).toBeNull();
   });
 });

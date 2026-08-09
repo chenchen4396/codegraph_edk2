@@ -26,6 +26,7 @@ export interface SynthPassResult {
 export interface ChunkResult {
   resolved: ResolvedRef[];
   unresolved: UnresolvedRef[];
+  refused?: UnresolvedRef[];
   deferredChain: UnresolvedRef[];
   deferredThisMember: UnresolvedRef[];
   byMethod: Record<string, number>;

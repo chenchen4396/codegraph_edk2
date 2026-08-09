@@ -46,6 +46,24 @@ export interface ResolvedRef {
 }
 
 /**
+ * A reference the framework DECLARES invalid — the name looks like a symbol
+ * of the framework's kind (a `gXxx` GUID candidate, a `PcdGet*(X)` PCD usage)
+ * but is NOT declared in the framework's authoritative sections (DEC
+ * [Guids]/[Protocols]/[Ppis]/[Pcds*], UNI `#string`). The resolver must
+ * DELETE such rows rather than leave them unresolved: they are noise, not
+ * pending work (a later file gaining the symbol can't make them valid — the
+ * framework's declaration site is the only authority). This is what makes
+ * declaration-driven matching possible: extraction uses broad candidate
+ * shapes, resolution admits only declared names, everything else is dropped.
+ */
+export interface RefusedRef {
+  original: UnresolvedRef;
+  refused: true;
+  /** Why the framework refuses the ref (for diagnostics/tests) */
+  reason?: string;
+}
+
+/**
  * Result of resolution attempt
  */
 export interface ResolutionResult {
@@ -53,6 +71,9 @@ export interface ResolutionResult {
   resolved: ResolvedRef[];
   /** References that couldn't be resolved */
   unresolved: UnresolvedRef[];
+  /** References a framework declared invalid — persisted by DELETING their
+   * rows (no edge, no failed status; they can never become valid). */
+  refused?: UnresolvedRef[];
   /** Statistics */
   stats: {
     total: number;
@@ -200,8 +221,10 @@ export interface FrameworkResolver {
   languages?: Language[];
   /** Detect if project uses this framework (project-level, called once at startup) */
   detect(context: ResolutionContext): boolean;
-  /** Resolve a reference using framework-specific patterns */
-  resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null;
+  /** Resolve a reference using framework-specific patterns. May return a
+   * {@link RefusedRef} to declare the reference invalid (dropped from the
+   * unresolved set entirely), `null` to leave it to other strategies. */
+  resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | RefusedRef | null;
   /**
    * Opt a reference NAME through the resolver's name-exists pre-filter, even when
    * no node is named that. Needed for dynamic dispatch where the call target is

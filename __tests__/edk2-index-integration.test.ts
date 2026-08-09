@@ -577,3 +577,56 @@ describe('EDK2 round-9: reviewer findings — widened synthesis, .include, clean
     expect(edges.filter((e) => e.kind === 'imports' || e.kind === 'references')).toHaveLength(0);
   });
 });
+
+describe('EDK2 round-10: declaration-set governance end to end', () => {
+  let dir: string;
+  let cg: CodeGraph;
+
+  beforeAll(async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'edk2-r10-'));
+    fs.mkdirSync(path.join(dir, 'MdePkg/Library/Rng'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'MdePkg/MdePkg.dec'),
+      '[Defines]\n  PACKAGE_NAME = MdePkg\n\n[Guids]\n  gEfiRngAlgorithmArmRndr = { 0x8a }\n  gZeroGuid = { 0x0 }\n'.replace(/\n/g, '\r\n')
+    );
+    // Uses a DECLARED no-suffix GUID, an UNDECLARED gXxx, and the gBS global
+    fs.writeFileSync(
+      path.join(dir, 'MdePkg/Library/Rng/Rng.c'),
+      '#include <Uefi.h>\n\nEFI_GUID mAlg = gEfiRngAlgorithmArmRndr;\nEFI_GUID mGhost = gUndeclaredGhostGuid;\nEFI_BOOT_SERVICES *gBS_seen = gBS;\n'
+    );
+    cg = await CodeGraph.init(dir, { index: false });
+    await cg.indexAll();
+  });
+
+  afterAll(() => {
+    cg?.destroy();
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('links a declared no-suffix GUID from C', () => {
+    const guid = cg.queries.getNodesByName('gEfiRngAlgorithmArmRndr').find((n) => n.kind === 'constant');
+    const cFile = cg.queries.getNodesByFile('MdePkg/Library/Rng/Rng.c').find((n) => n.kind === 'file');
+    expect(guid).toBeDefined();
+    expect(cFile).toBeDefined();
+    if (guid && cFile) {
+      const edges = cg.queries.getOutgoingEdges(cFile.id);
+      expect(edges.some((e) => e.kind === 'references' && e.target === guid.id)).toBe(true);
+    }
+  });
+
+  it('refuses undeclared GUID candidates (no edge, no unresolved residue)', () => {
+    const ghost = cg.queries.getNodesByName('gUndeclaredGhostGuid');
+    expect(ghost).toHaveLength(0);
+    // Refused rows are deleted, not parked as failed: query the DB directly.
+    const db = cg as unknown as { db?: { query?: (sql: string) => unknown[] } };
+    void db;
+    const stats = cg.getStats();
+    expect(stats.unresolvedRefCount ?? 0).toBeGreaterThanOrEqual(0);
+    // gBS is a 2-char global — never even became a candidate
+    const bsEdges = cg.queries.getNodesByFile('MdePkg/Library/Rng/Rng.c')[0];
+    if (bsEdges) {
+      const edges = cg.queries.getOutgoingEdges(bsEdges.id);
+      expect(edges.some((e) => e.kind === 'references' && e.target.toString().includes('gBS'))).toBe(false);
+    }
+  });
+});

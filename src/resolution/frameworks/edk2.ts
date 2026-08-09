@@ -37,6 +37,7 @@ import type {
   FrameworkResolver,
   UnresolvedRef,
   ResolvedRef,
+  RefusedRef,
   ResolutionContext,
   FrameworkExtractionResult,
 } from '../types';
@@ -53,16 +54,16 @@ import type {
 const PCD_USAGE_RE =
   /\b(?:Pcd|FixedPcd|PatchPcd|FeaturePcd)(?:Get|Set)(?:Ex)?(?:8|16|32|64|Ptr|Size|Bool)?S?\s*\(\s*(?:(?:&\s*)?([A-Za-z0-9_]+)TokenSpaceGuid\s*[.,]\s*)?((?:Pcd[A-Za-z0-9_]+|[A-Z][A-Za-z0-9_]*))\b/g;
 
-// GUID / PPI / protocol usage: any `g<Cap>…(ProtocolGuid|PpiGuid|Protocol|Ppi|
-// Guid[_\d+])` — vendor/custom GUIDs (gAcpiTableHobGuid, gZeroGuid, gAmiXxx…)
-// are as graph-relevant as the gEfi*/gEdkii* canon; refs that name no DEC
-// constant simply stay unresolved. Covers legacy spellings without a `Guid`
-// suffix (gEfiMmEndOfPeiProtocol, gEfiPeiMmConfigurationPpi) and
-// version-suffixed GUIDs (gEfiNetworkInterfaceIdentifierProtocolGuid_31).
-// Token-space GUIDs (gEfiMdePkgTokenSpaceGuid) also match and resolve to
-// their DEC [Guids] entry, while the PCD accessor regex additionally
-// captures the qualified PCD name.
-const GUID_USAGE_RE = /\b(g[A-Z][A-Za-z0-9_]*(?:ProtocolGuid|PpiGuid|Protocol|Ppi|Guid(?:_\d+)?))\b/g;
+// GUID / PPI / protocol usage candidates: any `g<Cap>…` identifier. The
+// SHAPE is only a candidate gate — authority is the DEC declaration set:
+// resolve() admits names declared in a DEC [Guids]/[Protocols]/[Ppis]
+// section and refuses the rest (gBS/gRT globals, doc-comment mentions,
+// undeclared spellings), so no suffix convention (Guid/ProtocolGuid/Ppi,
+// versioned Guid_31, or none at all — gEfiRngAlgorithmArmRndr) is ever
+// needed and no naming-convention drift can drop a real edge. `{4,}` keeps
+// the 2-3 char service-table globals (gBS, gRT, gST, gDS, gPS) from even
+// becoming candidates.
+const GUID_USAGE_RE = /\b(g[A-Z][A-Za-z0-9_]{3,})\b/g;
 
 // HII string-token usage: `STRING_TOKEN (STR_X)` in C — the token is declared
 // as a constant in a `.uni` file (same simple-name contract as PCD/GUID).
@@ -137,6 +138,40 @@ function buildIncludeIndex(context: ResolutionContext): Map<string, string[]> {
   return index;
 }
 
+/**
+ * Per-project DECLARED-name sets, built lazily from the indexed nodes:
+ * which GUID/Protocol/PPI names are declared in DEC sections, which PCD
+ * names in DEC [Pcds*], which string tokens in UNI files. Authority for
+ * C-side synthetic refs: a candidate name that is NOT declared is refused
+ * (dropped), whatever its shape; a declared name resolves regardless of
+ * shape (gEfiRngAlgorithmArmRndr has no Guid suffix at all).
+ */
+interface DeclaredSets {
+  /** DEC [Guids]/[Protocols]/[Ppis] entry names (`gXxx`) */
+  guids: Set<string>;
+  /** DEC [Pcds*] PCD names (simple name, e.g. `PcdDebugPropertyMask`) */
+  pcds: Set<string>;
+  /** UNI `#string` tokens */
+  strings: Set<string>;
+}
+const declaredSets = new WeakMap<ResolutionContext, DeclaredSets>();
+function buildDeclaredSets(context: ResolutionContext): DeclaredSets {
+  const sets: DeclaredSets = { guids: new Set(), pcds: new Set(), strings: new Set() };
+  for (const n of context.getNodesByKind('constant')) {
+    if (n.language !== 'edk2') continue;
+    if (n.filePath.toLowerCase().endsWith('.uni')) {
+      sets.strings.add(n.name);
+    } else if (n.filePath.toLowerCase().endsWith('.dec')) {
+      // PCD constants carry the qualified `TokenSpace.PcdName`; GUID/
+      // Protocol/PPI constants are bare `gXxx` names (DEC parser requires
+      // the g prefix). Library-class constants have neither shape.
+      if (n.name.startsWith('g')) sets.guids.add(n.name);
+      else if (n.qualifiedName.includes('.')) sets.pcds.add(n.name);
+    }
+  }
+  return sets;
+}
+
 export const edk2Resolver: FrameworkResolver = {
   name: 'edk2',
   // `cpp` included: UEFI C++ sources (.cpp/.cc — GoogleTest hosts,
@@ -155,13 +190,58 @@ export const edk2Resolver: FrameworkResolver = {
   // for scoped refs). Also C `#include <...>` targets (`Uefi.h`,
   // `Protocol/Arp.h`): their native import refs die in the pre-filter today.
   claimsReference(name: string): boolean {
-    return DESCRIPTOR_EXT.test(name) || name.includes('/') || name.endsWith('.h');
+    return (
+      DESCRIPTOR_EXT.test(name) ||
+      name.includes('/') ||
+      name.endsWith('.h') ||
+      // Wide GUID-candidate shape: pre-filter would drop undeclared gXxx
+      // names (no node exists) before resolve() can refuse them.
+      /^g[A-Z][A-Za-z0-9_]{3,}$/.test(name)
+    );
   },
 
-  resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | RefusedRef | null {
     if (ref.referenceKind !== 'references' && ref.referenceKind !== 'imports') return null;
 
     const name = ref.referenceName;
+    const refused = (reason: string): RefusedRef => ({ original: ref, refused: true, reason });
+
+    // C-side synthetic refs (emitted by this resolver's extract(), keyed by
+    // the FILE node id) are DECLARATION-GOVERNED: extract() uses broad
+    // candidate shapes, and only names declared in the authoritative EDK2
+    // sections (DEC [Guids]/[Protocols]/[Ppis]/[Pcds*], UNI `#string`) are
+    // real — everything else (gBS/gRT globals, doc mentions, undeclared
+    // spellings, non-PCD accessor args) is refused and dropped, whatever its
+    // shape. Shape conventions (Guid/ProtocolGuid suffixes) are never
+    // required: gEfiRngAlgorithmArmRndr resolves because it is DEC-declared.
+    if (
+      ref.language === 'c' &&
+      ref.referenceKind === 'references' &&
+      ref.fromNodeId === `file:${ref.filePath}`
+    ) {
+      let sets = declaredSets.get(context);
+      if (!sets) {
+        sets = buildDeclaredSets(context);
+        declaredSets.set(context, sets);
+      }
+      if (ref.candidates && ref.candidates.length > 0) {
+        // PCD accessor argument (`PcdGet32 (PcdX)`, `FixedPcdGet32 (PL011…)`)
+        // — AutoGen generates it from DEC declarations, so it must be one.
+        if (!sets.pcds.has(name)) {
+          return refused(`PCD '${name}' is not declared in any DEC [Pcds*] section`);
+        }
+      } else if (/^g[A-Z][A-Za-z0-9_]{3,}$/.test(name)) {
+        if (!sets.guids.has(name)) {
+          return refused(`GUID '${name}' is not declared in any DEC [Guids]/[Protocols]/[Ppis] section`);
+        }
+      } else if (/^STR_[A-Za-z0-9_]+$/.test(name)) {
+        if (!sets.strings.has(name)) {
+          return refused(`string token '${name}' is not declared in any .uni file`);
+        }
+      } else {
+        return null; // not an EDK2 candidate shape — other strategies own it
+      }
+    }
 
     // ENTRY_POINT / UNLOAD_IMAGE / CONSTRUCTOR → C function. The Edk2Extractor
     // carries the module's [Sources] .c paths in `candidates` so the lookup is
@@ -296,7 +376,7 @@ export const edk2Resolver: FrameworkResolver = {
       content.indexOf('gEfi') === -1 &&
       content.indexOf('gEdkii') === -1 &&
       content.indexOf('STRING_TOKEN') === -1 &&
-      !/g[A-Z][A-Za-z0-9_]*(?:ProtocolGuid|PpiGuid|Protocol|Ppi|Guid(?:_\d+)?)\b/.test(content)
+      !/g[A-Z][A-Za-z0-9_]{3,}\b/.test(content)
     ) {
       return { nodes: [], references: [] };
     }
@@ -352,7 +432,10 @@ export const edk2Resolver: FrameworkResolver = {
       const full = tokenSpace
         ? `${tokenSpace}TokenSpaceGuid.${pcdName}`
         : pcdName;
-      emit(pcdName, full === pcdName ? undefined : [full], m.index);
+      // Always carry the candidate (simple or qualified): resolve() gates
+      // synthetic refs on the DEC PCD declaration set, and the candidates
+      // field is what marks this ref as a PCD-accessor usage.
+      emit(pcdName, [full], m.index);
     }
 
     // GUID / Protocol / PPI usage: `gEfiArpProtocolGuid`, `gEfiDxeIplPpiGuid`.
