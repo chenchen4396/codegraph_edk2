@@ -23,9 +23,15 @@
  *
  * `resolve()` returns `references`/`imports` edges plus library-CALL bridges
  * (C call → library instance function via the [LibraryClasses]→DSC→[Sources]
- * declaration chain). The synthetic PCD/GUID/STRING_TOKEN `references` refs
- * name the PCD/constant, never shadowing the ordinary function edge for the
- * accessor call itself (e.g. `LibPcdGet32` stays a normal name resolution).
+ * declaration chain). A call name that exists only in library instances is
+ * REFUSED (row deleted) when the caller module declares none of the providing
+ * classes — plain same-name resolution would mint an edge the build could
+ * never link. Instance-level ambiguity (multi-platform DSC mappings,
+ * module-type-partitioned sections, !if branches) keeps the row instead and
+ * falls through to ordinary resolution. The synthetic PCD/GUID/STRING_TOKEN
+ * `references` refs name the PCD/constant, never shadowing the ordinary
+ * function edge for the accessor call itself (e.g. `LibPcdGet32` falls back
+ * to normal name resolution when its instances are ambiguous).
  * Returning `confidence >= 0.9` short-circuits resolution
  * (`resolveOne` Strategy 1), and `gateFrameworkLanguage` preserves the
  * cross-language `c → edk2` and `edk2 → edk2` edges (EDK2 isn't a known
@@ -214,11 +220,11 @@ const libraryIndex = new WeakMap<ResolutionContext, LibraryIndex>();
 /** Parse an INF's [Defines]/[LibraryClasses]/[Sources] with section tracking. */
 function parseInfLight(
   content: string
-): { libraryClass: string | null; classes: string[]; sources: string[] } {
+): { libraryClass: string[]; classes: string[]; sources: string[] } {
   let section = '';
   const classes: string[] = [];
   const sources: string[] = [];
-  let libraryClass: string | null = null;
+  const libraryClass: string[] = [];
   for (const raw of content.split('\n')) {
     const line = raw.trim();
     const hdr = line.match(/^\[([^\]]+)\]/);
@@ -229,7 +235,7 @@ function parseInfLight(
     if (line === '' || line.startsWith('!') || line.startsWith('#')) continue;
     if (section === 'defines') {
       const lc = line.match(/^LIBRARY_CLASS\s*=\s*([A-Za-z0-9_]+)/i);
-      if (lc) libraryClass = lc[1]!;
+      if (lc) libraryClass.push(lc[1]!);
     } else if (section === 'libraryclasses') {
       const cls = line.split(/\s+/)[0]!;
       if (cls) classes.push(cls);
@@ -239,6 +245,39 @@ function parseInfLight(
     }
   }
   return { libraryClass, classes, sources };
+}
+
+/**
+ * Inline `!include` file rows into a DSC/INF listing. EDK2 platform DSC
+ * files routinely split their [LibraryClasses] into `!include` fragments
+ * (e.g. NetworkPkg/NetworkLibs.dsc.inc), and those rows ARE the authoritative
+ * Class|Impl.inf mappings — skipping them loses the platform's instance
+ * choice. Included rows keep their position, so the caller's section
+ * tracking (incl. a [LibraryClasses] header inside the fragment) applies.
+ * Depth-capped against recursive includes.
+ */
+function expandIncludeLines(content: string, filePath: string, readFile: (p: string) => string | null, depth = 0): string {
+  if (depth > 5) return content;
+  const rel = (p: string): string => {
+    const dir = filePath.includes('/') ? filePath.slice(0, filePath.lastIndexOf('/')) : '';
+    return path.posix.normalize(dir ? `${dir}/${p}` : p).replace(/\\/g, '/');
+  };
+  const out: string[] = [];
+  for (const raw of content.split('\n')) {
+    const inc = raw.trim().match(/^!include\s+(\S+)/i);
+    if (inc) {
+      // EDK2 `!include` paths resolve against the WORKSPACE ROOT, not the
+      // including file's directory (`!include NetworkPkg/NetworkLibs.dsc.inc`
+      // from OvmfPkg/OvmfPkgX64.dsc). Try the root-relative form first, then
+      // the file-relative form for odd layouts.
+      const incPath = rel(inc[1]!);
+      const incContent = readFile(inc[1]!) ?? readFile(incPath);
+      if (incContent) out.push(expandIncludeLines(incContent, inc[1]!, readFile, depth + 1));
+      continue;
+    }
+    out.push(raw);
+  }
+  return out.join('\n');
 }
 
 function buildLibraryIndex(context: ResolutionContext): LibraryIndex {
@@ -252,7 +291,11 @@ function buildLibraryIndex(context: ResolutionContext): LibraryIndex {
   };
   const rel = (infPath: string, p: string): string => {
     const dir = infPath.includes('/') ? infPath.slice(0, infPath.lastIndexOf('/')) : '';
-    return (dir ? `${dir}/${p}` : p).replace(/\\/g, '/');
+    return path.posix.normalize(dir ? `${dir}/${p}` : p).replace(/\\/g, '/');
+  };
+  const readExpanded = (p: string): string | null => {
+    const c = context.readFile(p);
+    return c === null ? null : expandIncludeLines(c, p, (q) => context.readFile(q));
   };
   const addInstance = (map: Map<string, string[]>, cls: string, inf: string) => {
     const arr = map.get(cls);
@@ -264,7 +307,7 @@ function buildLibraryIndex(context: ResolutionContext): LibraryIndex {
   // Pass 1: INF modules → per-file class declarations + LIBRARY_CLASS instances.
   for (const n of context.getNodesByKind('module')) {
     if (n.language !== 'edk2' || !n.filePath.toLowerCase().endsWith('.inf')) continue;
-    const content = context.readFile(n.filePath);
+    const content = readExpanded(n.filePath);
     if (!content) continue;
     const info = parseInfLight(content);
     const modFns = idx.moduleFunctions.get(n.filePath) ?? new Set<string>();
@@ -278,14 +321,14 @@ function buildLibraryIndex(context: ResolutionContext): LibraryIndex {
       }
     }
     if (modFns.size > 0) idx.moduleFunctions.set(n.filePath, modFns);
-    if (info.libraryClass) addInstance(idx.libClassInstances, info.libraryClass, n.filePath);
+    for (const cls of info.libraryClass) addInstance(idx.libClassInstances, cls, n.filePath);
   }
   // Pass 2: DSC — top-level [LibraryClasses] rows set the authoritative
   // default instance; `<LibraryClasses>` rows inside a [Components] block
   // override per module.
   for (const n of context.getNodesByKind('module')) {
     if (n.language !== 'edk2' || !n.filePath.toLowerCase().endsWith('.dsc')) continue;
-    const content = context.readFile(n.filePath);
+    const content = readExpanded(n.filePath);
     if (!content) continue;
     let section = '';
     let inBlock = false;
@@ -351,16 +394,20 @@ function buildLibraryIndex(context: ResolutionContext): LibraryIndex {
     const content = context.readFile(infPath);
     if (!content) continue;
     const info = parseInfLight(content);
-    if (!info.libraryClass) continue;
+    if (info.libraryClass.length === 0) continue;
+    // First declared class is the canonical one; arch-split instances
+    // (BaseLib's [Sources.Ia32] + [Sources.X64]) define the same function in
+    // several files — dedup per (instance, function name), keep the first
+    // definition: any one of them is the instance's implementation.
     for (const src of info.sources) {
       const file = rel(infPath, src);
-      const key = `${infPath}\u0000${file}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
       for (const fn of context.getNodesInFile(file)) {
         if (fn.kind !== 'function') continue;
+        const key = `${infPath}\u0000${fn.name}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
         const arr = idx.fns.get(fn.name) ?? [];
-        arr.push({ nodeId: fn.id, className: info.libraryClass!, infPath });
+        arr.push({ nodeId: fn.id, className: info.libraryClass[0]!, infPath });
         idx.fns.set(fn.name, arr);
       }
     }
@@ -437,10 +484,21 @@ export const edk2Resolver: FrameworkResolver = {
         if (cands.length === 1) {
           return { original: ref, targetNodeId: cands[0]!.nodeId, confidence: 0.9, resolvedBy: 'framework' };
         }
-        return refused(
-          `library call '${name}': caller module declares none of the providing classes ` +
-            `(${[...new Set(targets.map((t) => t.className))].join(', ')})`
-        );
+        // Refuse ONLY when the caller declares none of the providing classes
+        // (the name lives exclusively in library instances, so the build
+        // could never link this call and same-name resolution would mint a
+        // wrong edge). Instance-level ambiguity — multi-platform DSC
+        // mappings, module-type-partitioned [LibraryClasses.common.*]
+        // sections, !if branches, or an unknown per-module override — keeps
+        // the row and falls through to ordinary resolution.
+        const provided = new Set(targets.map((t) => t.className));
+        if (![...caller.classes].some((c) => provided.has(c))) {
+          return refused(
+            `library call '${name}': caller module declares none of the providing classes ` +
+              `(${[...provided].join(', ')}); the build could not link it`
+          );
+        }
+        return null;
       }
     }
 

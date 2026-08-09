@@ -882,4 +882,88 @@ describe('edk2Resolver — library-call bridge (unit)', () => {
     };
     expect(edk2Resolver.resolve(ref, ctx as never)).toBeNull();
   });
+
+  it('keeps the row (null) when the DSC maps the class to multiple instances', () => {
+    const ctx = libCtx();
+    const baseRead = ctx.readFile.bind(ctx);
+    (ctx as unknown as { readFile: (p: string) => string | null }).readFile = (p: string) => {
+      if (p === 'TestPkg/TestPkg.dsc') {
+        return '[Defines]\n  PLATFORM_NAME = TestPkg\n\n[LibraryClasses]\n  TestLib|TestPkg/Library/TestLib/TestLib.inf\n  TestLib|TestPkg/Library/TestLib/TestLib2.inf\n';
+      }
+      if (p === 'TestPkg/Library/TestLib/TestLib2.inf') return '[Defines]\n  BASE_NAME = TestLib2\n  LIBRARY_CLASS = TestLib\n  MODULE_TYPE = BASE\n\n[Sources]\n  TestLib2.c\n';
+      return baseRead(p);
+    };
+    const ref: UnresolvedRef = {
+      fromNodeId: 'function:caller4',
+      referenceName: 'FetchValue',
+      referenceKind: 'calls',
+      line: 4,
+      column: 12,
+      filePath: 'TestPkg/Drv/Drv.c',
+      language: 'c',
+    };
+    const result = edk2Resolver.resolve(ref, ctx as never);
+    // ambiguous effective instance → null (row survives for normal resolution)
+    expect(result).toBeNull();
+  });
+
+  it('resolves through an arch-split instance (same name, multiple [Sources] files)', () => {
+    const ctx = libCtx();
+    const fn2 = mkConstant('FetchValue', 'FetchValue', 'TestPkg/Library/TestLib/TestLibArch.c', 3);
+    fn2.kind = 'function';
+    const baseGetInFile = ctx.getNodesInFile.bind(ctx);
+    const baseRead = ctx.readFile.bind(ctx);
+    (ctx as unknown as { getNodesInFile: (p: string) => unknown[] }).getNodesInFile = (p: string) =>
+      p === 'TestPkg/Library/TestLib/TestLib.c' || p === 'TestPkg/Library/TestLib/TestLibArch.c'
+        ? [p === 'TestPkg/Library/TestLib/TestLib.c' ? baseGetInFile(p)[0]! : fn2]
+        : p === 'TestPkg/Drv/Drv.c'
+          ? [mkConstant('Get', 'Get', p, 3)]
+          : [];
+    (ctx as unknown as { readFile: (p: string) => string | null }).readFile = (p: string) => {
+      if (p === 'TestPkg/Library/TestLib/TestLib.inf') {
+        return '[Defines]\n  BASE_NAME = TestLib\n  LIBRARY_CLASS = TestLib\n  MODULE_TYPE = BASE\n\n[Sources]\n  TestLib.c\n  TestLibArch.c\n';
+      }
+      return baseRead(p);
+    };
+    const ref: UnresolvedRef = {
+      fromNodeId: 'function:caller5',
+      referenceName: 'FetchValue',
+      referenceKind: 'calls',
+      line: 4,
+      column: 12,
+      filePath: 'TestPkg/Drv/Drv.c',
+      language: 'c',
+    };
+    const result = edk2Resolver.resolve(ref, ctx as never);
+    // both files define FetchValue under the SAME (class, instance) — dedup
+    // must yield exactly one candidate and a 0.9 edge
+    expect(result).not.toBeNull();
+    expect(result!.confidence).toBeGreaterThanOrEqual(0.9);
+  });
+
+  it('honors DSC !include fragments for the instance mapping', () => {
+    const ctx = libCtx();
+    const baseRead = ctx.readFile.bind(ctx);
+    (ctx as unknown as { readFile: (p: string) => string | null }).readFile = (p: string) => {
+      if (p === 'TestPkg/TestPkg.dsc') {
+        return '[Defines]\n  PLATFORM_NAME = TestPkg\n\n[LibraryClasses]\n  !include TestPkg/Library.map.inc\n';
+      }
+      if (p === 'TestPkg/Library.map.inc') {
+        return '  TestLib|TestPkg/Library/TestLib/TestLib.inf\n';
+      }
+      return baseRead(p);
+    };
+    const ref: UnresolvedRef = {
+      fromNodeId: 'function:caller6',
+      referenceName: 'FetchValue',
+      referenceKind: 'calls',
+      line: 4,
+      column: 12,
+      filePath: 'TestPkg/Drv/Drv.c',
+      language: 'c',
+    };
+    const result = edk2Resolver.resolve(ref, ctx as never);
+    expect(result).not.toBeNull();
+    expect(result!.confidence).toBeGreaterThanOrEqual(0.9);
+  });
 });
