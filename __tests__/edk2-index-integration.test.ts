@@ -630,3 +630,80 @@ describe('EDK2 round-10: declaration-set governance end to end', () => {
     }
   });
 });
+
+describe('EDK2 round-11: library-call bridge (C → library instance)', () => {
+  let dir: string;
+  let cg: CodeGraph;
+
+  beforeAll(async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'edk2-r11-'));
+    // Library instance: LIBRARY_CLASS = TestLib, defines FetchValue
+    fs.mkdirSync(path.join(dir, 'TestPkg/Library/TestLib'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'TestPkg/Library/TestLib/TestLib.inf'),
+      '[Defines]\n  BASE_NAME = TestLib\n  LIBRARY_CLASS = TestLib\n  MODULE_TYPE = BASE\n\n[Sources]\n  TestLib.c\n'.replace(/\n/g, '\r\n')
+    );
+    fs.writeFileSync(
+      path.join(dir, 'TestPkg/Library/TestLib/TestLib.c'),
+      '#include <Uefi.h>\n\nUINT32 FetchValue (VOID) { return 42; }\n'
+    );
+    // Consumer module: declares TestLib, calls FetchValue
+    fs.mkdirSync(path.join(dir, 'TestPkg/Drv'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'TestPkg/Drv/Drv.inf'),
+      '[Defines]\n  BASE_NAME = Drv\n  MODULE_TYPE = DXE_DRIVER\n\n[Sources]\n  Drv.c\n\n[LibraryClasses]\n  TestLib\n  DebugLib\n'.replace(/\n/g, '\r\n')
+    );
+    fs.writeFileSync(
+      path.join(dir, 'TestPkg/Drv/Drv.c'),
+      '#include <Uefi.h>\n\nUINT32 Get (VOID) { return FetchValue (); }\n'
+    );
+    // Second consumer that does NOT declare TestLib (must not link)
+    fs.mkdirSync(path.join(dir, 'TestPkg/Other'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'TestPkg/Other/Other.inf'),
+      '[Defines]\n  BASE_NAME = Other\n  MODULE_TYPE = DXE_DRIVER\n\n[Sources]\n  Other.c\n'.replace(/\n/g, '\r\n')
+    );
+    fs.writeFileSync(
+      path.join(dir, 'TestPkg/Other/Other.c'),
+      '#include <Uefi.h>\n\nUINT32 Get2 (VOID) { return FetchValue (); }\n'
+    );
+    // Platform DSC: TestLib → the instance
+    fs.writeFileSync(
+      path.join(dir, 'TestPkg/TestPkg.dsc'),
+      '[Defines]\n  PLATFORM_NAME = TestPkg\n\n[LibraryClasses]\n  TestLib|TestPkg/Library/TestLib/TestLib.inf\n  DebugLib|TestPkg/Library/NullDebugLib/NullDebugLib.inf\n\n[Components]\n  TestPkg/Drv/Drv.inf\n  TestPkg/Other/Other.inf\n'.replace(/\n/g, '\r\n')
+    );
+    // DEC so the tree is detected as EDK2
+    fs.writeFileSync(
+      path.join(dir, 'TestPkg/TestPkg.dec'),
+      '[Defines]\n  PACKAGE_NAME = TestPkg\n\n[LibraryClasses]\n  TestLib|Include/Library/TestLib.h\n'.replace(/\n/g, '\r\n')
+    );
+
+    cg = await CodeGraph.init(dir, { index: false });
+    await cg.indexAll();
+  });
+
+  afterAll(() => {
+    cg?.destroy();
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('links a library call to the DSC-selected instance function', () => {
+    const fn = cg.queries.getNodesByName('FetchValue').find((n) => n.kind === 'function');
+    const getFn = cg.queries.getNodesByFile('TestPkg/Drv/Drv.c').find((n) => n.kind === 'function' && n.name === 'Get');
+    expect(fn).toBeDefined();
+    expect(getFn).toBeDefined();
+    if (fn && getFn) {
+      const edges = cg.queries.getOutgoingEdges(getFn.id);
+      expect(edges.some((e) => e.kind === 'calls' && e.target === fn.id)).toBe(true);
+    }
+  });
+
+  it('does not link a call from a module that never declared the class', () => {
+    const fn = cg.queries.getNodesByName('FetchValue').find((n) => n.kind === 'function');
+    const get2 = cg.queries.getNodesByFile('TestPkg/Other/Other.c').find((n) => n.kind === 'function' && n.name === 'Get2');
+    if (fn && get2) {
+      const edges = cg.queries.getOutgoingEdges(get2.id);
+      expect(edges.some((e) => e.kind === 'calls' && e.target === fn.id)).toBe(false);
+    }
+  });
+});

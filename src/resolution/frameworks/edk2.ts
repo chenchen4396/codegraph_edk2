@@ -21,11 +21,12 @@
  *     GUID-usage calls and emits synthetic `references` refs with
  *     `language: 'c'`, keyed by the C file's file node.
  *
- * `resolve()` only ever returns `references`/`imports` edges. It deliberately
- * does NOT touch `calls` refs, so a `PcdGet32(…)` call's real function edge to
- * `PcdLib` (resolved by normal name/import matching) is never shadowed: the
- * synthetic `references` ref names the PCD, a separate edge to the DEC
- * declaration. Returning `confidence >= 0.9` short-circuits resolution
+ * `resolve()` returns `references`/`imports` edges plus library-CALL bridges
+ * (C call → library instance function via the [LibraryClasses]→DSC→[Sources]
+ * declaration chain). The synthetic PCD/GUID/STRING_TOKEN `references` refs
+ * name the PCD/constant, never shadowing the ordinary function edge for the
+ * accessor call itself (e.g. `LibPcdGet32` stays a normal name resolution).
+ * Returning `confidence >= 0.9` short-circuits resolution
  * (`resolveOne` Strategy 1), and `gateFrameworkLanguage` preserves the
  * cross-language `c → edk2` and `edk2 → edk2` edges (EDK2 isn't a known
  * language family, so `crossesKnownFamily` is false — config↔code bridges
@@ -172,6 +173,201 @@ function buildDeclaredSets(context: ResolutionContext): DeclaredSets {
   return sets;
 }
 
+/**
+ * LIBRARY-CALL BRIDGE — the EDK2 link model is declaration-driven end to end:
+ *
+ *   module C calls Foo()
+ *     └─ module INF [LibraryClasses] declares class C (Foo's library class)
+ *        └─ platform DSC [LibraryClasses] `C|Impl.inf` — or the unique INF
+ *           whose LIBRARY_CLASS = C when no DSC / no mapping (per-component
+ *           `<LibraryClasses>` overrides refine the instance per module)
+ *           └─ instance INF [Sources] defines Foo → the edge
+ *
+ * C sources have no import statement for library functions (the build links
+ * them); plain cross-module name matching therefore misses almost every
+ * library call (115k+ unresolved calls on the tianocore corpus). This index
+ * maps function names → declaring library instance, keyed by the caller's
+ * declared classes, and admits only unambiguous (caller-declared class +
+ * single matching instance) calls at confidence 0.9.
+ */
+interface LibCallTarget {
+  nodeId: string;
+  className: string;
+  infPath: string;
+}
+interface LibraryIndex {
+  /** C file → owning module INF + the classes its [LibraryClasses] declares */
+  fileModules: Map<string, { moduleInf: string; classes: Set<string> }>;
+  /** module INF → function names defined in its [Sources] (module-local wins) */
+  moduleFunctions: Map<string, Set<string>>;
+  /** class → DSC top-level [LibraryClasses] instance INFs (authoritative) */
+  defaultInstances: Map<string, string[]>;
+  /** class → LIBRARY_CLASS-declared instance INFs (fallback when no DSC map) */
+  libClassInstances: Map<string, string[]>;
+  /** module INF → class → per-component override instance INF */
+  overrides: Map<string, Map<string, string>>;
+  /** function name → declaring library-instance targets */
+  fns: Map<string, LibCallTarget[]>;
+}
+const libraryIndex = new WeakMap<ResolutionContext, LibraryIndex>();
+
+/** Parse an INF's [Defines]/[LibraryClasses]/[Sources] with section tracking. */
+function parseInfLight(
+  content: string
+): { libraryClass: string | null; classes: string[]; sources: string[] } {
+  let section = '';
+  const classes: string[] = [];
+  const sources: string[] = [];
+  let libraryClass: string | null = null;
+  for (const raw of content.split('\n')) {
+    const line = raw.trim();
+    const hdr = line.match(/^\[([^\]]+)\]/);
+    if (hdr) {
+      section = hdr[1]!.toLowerCase().split(',')[0]!.replace(/\.[A-Za-z0-9_]+/g, '');
+      continue;
+    }
+    if (line === '' || line.startsWith('!') || line.startsWith('#')) continue;
+    if (section === 'defines') {
+      const lc = line.match(/^LIBRARY_CLASS\s*=\s*([A-Za-z0-9_]+)/i);
+      if (lc) libraryClass = lc[1]!;
+    } else if (section === 'libraryclasses') {
+      const cls = line.split(/\s+/)[0]!;
+      if (cls) classes.push(cls);
+    } else if (section === 'sources') {
+      const sp = line.split(/\s+/)[0]!.replace(/\|.*$/, '').trim();
+      if (/\.(c|cc|cpp)$/i.test(sp)) sources.push(sp);
+    }
+  }
+  return { libraryClass, classes, sources };
+}
+
+function buildLibraryIndex(context: ResolutionContext): LibraryIndex {
+  const idx: LibraryIndex = {
+    fileModules: new Map(),
+    moduleFunctions: new Map(),
+    defaultInstances: new Map(),
+    libClassInstances: new Map(),
+    overrides: new Map(),
+    fns: new Map(),
+  };
+  const rel = (infPath: string, p: string): string => {
+    const dir = infPath.includes('/') ? infPath.slice(0, infPath.lastIndexOf('/')) : '';
+    return (dir ? `${dir}/${p}` : p).replace(/\\/g, '/');
+  };
+  const addInstance = (map: Map<string, string[]>, cls: string, inf: string) => {
+    const arr = map.get(cls);
+    if (arr) {
+      if (!arr.includes(inf)) arr.push(inf);
+    } else map.set(cls, [inf]);
+  };
+
+  // Pass 1: INF modules → per-file class declarations + LIBRARY_CLASS instances.
+  for (const n of context.getNodesByKind('module')) {
+    if (n.language !== 'edk2' || !n.filePath.toLowerCase().endsWith('.inf')) continue;
+    const content = context.readFile(n.filePath);
+    if (!content) continue;
+    const info = parseInfLight(content);
+    const modFns = idx.moduleFunctions.get(n.filePath) ?? new Set<string>();
+    for (const src of info.sources) {
+      const file = rel(n.filePath, src);
+      const entry = idx.fileModules.get(file) ?? { moduleInf: n.filePath, classes: new Set<string>() };
+      for (const cls of info.classes) entry.classes.add(cls);
+      idx.fileModules.set(file, entry);
+      for (const fnNode of context.getNodesInFile(file)) {
+        if (fnNode.kind === 'function') modFns.add(fnNode.name);
+      }
+    }
+    if (modFns.size > 0) idx.moduleFunctions.set(n.filePath, modFns);
+    if (info.libraryClass) addInstance(idx.libClassInstances, info.libraryClass, n.filePath);
+  }
+  // Pass 2: DSC — top-level [LibraryClasses] rows set the authoritative
+  // default instance; `<LibraryClasses>` rows inside a [Components] block
+  // override per module.
+  for (const n of context.getNodesByKind('module')) {
+    if (n.language !== 'edk2' || !n.filePath.toLowerCase().endsWith('.dsc')) continue;
+    const content = context.readFile(n.filePath);
+    if (!content) continue;
+    let section = '';
+    let inBlock = false;
+    let blockSection: string | null = null;
+    let currentComponent = '';
+    for (const raw of content.split('\n')) {
+      const line = raw.trim();
+      const hdr = line.match(/^\[([^\]]+)\]/);
+      if (hdr) {
+        section = hdr[1]!.toLowerCase().split(',')[0]!.replace(/\.[A-Za-z0-9_]+/g, '');
+        inBlock = false;
+        blockSection = null;
+        continue;
+      }
+      if (line === '' || line.startsWith('#') || line.startsWith('!')) continue;
+      if (inBlock) {
+        if (line === '}') {
+          inBlock = false;
+          blockSection = null;
+          currentComponent = '';
+          continue;
+        }
+        const inner = line.match(/^<([^>]+)>$/);
+        if (inner) {
+          blockSection = inner[1]!.toLowerCase().replace(/\.[A-Za-z0-9_]+/g, '');
+          continue;
+        }
+        if (blockSection === 'libraryclasses') {
+          const m = line.match(/^([A-Za-z0-9_]+)\s*\|\s*(\S+\.inf)/);
+          if (m && currentComponent) {
+            let ov = idx.overrides.get(currentComponent);
+            if (!ov) {
+              ov = new Map();
+              idx.overrides.set(currentComponent, ov);
+            }
+            ov.set(m[1]!, m[2]!);
+          }
+        }
+        continue;
+      }
+      if (section === 'libraryclasses') {
+        const m = line.match(/^([A-Za-z0-9_]+)\s*\|\s*(\S+\.inf)/);
+        if (m) addInstance(idx.defaultInstances, m[1]!, m[2]!);
+      } else if (section === 'components') {
+        const inf = line.match(/^(\S+\.inf)/);
+        if (inf) {
+          currentComponent = inf[1]!;
+          if (line.includes('{')) inBlock = true;
+        } else if (line === '{') {
+          inBlock = true;
+        }
+      }
+    }
+  }
+  // Pass 3: instance [Sources] functions — every candidate instance (DSC
+  // defaults, LIBRARY_CLASS fallbacks, per-module overrides).
+  const instanceInfs = new Set<string>();
+  for (const list of idx.defaultInstances.values()) for (const i of list) instanceInfs.add(i);
+  for (const list of idx.libClassInstances.values()) for (const i of list) instanceInfs.add(i);
+  for (const m of idx.overrides.values()) for (const i of m.values()) instanceInfs.add(i);
+  const seen = new Set<string>();
+  for (const infPath of instanceInfs) {
+    const content = context.readFile(infPath);
+    if (!content) continue;
+    const info = parseInfLight(content);
+    if (!info.libraryClass) continue;
+    for (const src of info.sources) {
+      const file = rel(infPath, src);
+      const key = `${infPath}\u0000${file}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      for (const fn of context.getNodesInFile(file)) {
+        if (fn.kind !== 'function') continue;
+        const arr = idx.fns.get(fn.name) ?? [];
+        arr.push({ nodeId: fn.id, className: info.libraryClass!, infPath });
+        idx.fns.set(fn.name, arr);
+      }
+    }
+  }
+  return idx;
+}
+
 export const edk2Resolver: FrameworkResolver = {
   name: 'edk2',
   // `cpp` included: UEFI C++ sources (.cpp/.cc — GoogleTest hosts,
@@ -201,10 +397,54 @@ export const edk2Resolver: FrameworkResolver = {
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | RefusedRef | null {
-    if (ref.referenceKind !== 'references' && ref.referenceKind !== 'imports') return null;
-
     const name = ref.referenceName;
     const refused = (reason: string): RefusedRef => ({ original: ref, refused: true, reason });
+
+    // LIBRARY-CALL BRIDGE (calls from C): the module's INF [LibraryClasses]
+    // declares the class, the DSC (or unique LIBRARY_CLASS) picks the
+    // instance, the instance's [Sources] defines the function. Confidence
+    // 0.9 short-circuits after the caller's declared-class check and an
+    // unambiguous single instance. A call name that only exists in library
+    // instances, from a module that did NOT declare the class, is refused:
+    // plain same-name resolution would otherwise mint a WRONG edge to the
+    // instance (the build would not link it). A module that defines the name
+    // itself wins (module-local functions shadow library names).
+    if (ref.referenceKind === 'calls' && ref.language === 'c' && ref.filePath) {
+      let lIdx = libraryIndex.get(context);
+      if (!lIdx) {
+        lIdx = buildLibraryIndex(context);
+        libraryIndex.set(context, lIdx);
+      }
+      const targets = lIdx.fns.get(name);
+      if (targets && targets.length > 0) {
+        const caller = lIdx.fileModules.get(ref.filePath);
+        if (!caller) return null; // not module code (BaseTools etc.) — normal resolution
+        if (lIdx.moduleFunctions.get(caller.moduleInf)?.has(name)) return null; // module-local definition wins
+        // Effective instance for the caller's module: per-module override
+        // first, then the DSC top-level default, then the unique
+        // LIBRARY_CLASS fallback (DSC is authoritative when present).
+        const effectiveInstance = (cls: string): string | null => {
+          const ov = lIdx.overrides.get(caller.moduleInf)?.get(cls);
+          if (ov) return ov;
+          const dsc = lIdx.defaultInstances.get(cls);
+          if (dsc && dsc.length > 0) return dsc.length === 1 ? dsc[0]! : null;
+          const lc = lIdx.libClassInstances.get(cls);
+          return lc && lc.length === 1 ? lc[0]! : null;
+        };
+        const cands = targets.filter(
+          (t) => caller.classes.has(t.className) && effectiveInstance(t.className) === t.infPath
+        );
+        if (cands.length === 1) {
+          return { original: ref, targetNodeId: cands[0]!.nodeId, confidence: 0.9, resolvedBy: 'framework' };
+        }
+        return refused(
+          `library call '${name}': caller module declares none of the providing classes ` +
+            `(${[...new Set(targets.map((t) => t.className))].join(', ')})`
+        );
+      }
+    }
+
+    if (ref.referenceKind !== 'references' && ref.referenceKind !== 'imports') return null;
 
     // C-side synthetic refs (emitted by this resolver's extract(), keyed by
     // the FILE node id) are DECLARATION-GOVERNED: extract() uses broad

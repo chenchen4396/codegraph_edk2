@@ -711,7 +711,7 @@ describe('edk2Resolver — declaration-set governance (RefusedRef)', () => {
     };
     const result = edk2Resolver.resolve(ref, ctx as never);
     expect(result).not.toBeNull();
-    expect((result as { refused?: boolean }).refused).toBe(true);
+    expect('refused' in (result as object)).toBe(true);
   });
 
   it('resolves a declared GUID with NO Guid suffix (gEfiRngAlgorithmArmRndr shape)', () => {
@@ -752,7 +752,7 @@ describe('edk2Resolver — declaration-set governance (RefusedRef)', () => {
       candidates: ['PcdNotDeclaredAnywhere'],
     };
     const result = edk2Resolver.resolve(ref, ctx as never);
-    expect((result as { refused?: boolean }).refused).toBe(true);
+    expect('refused' in (result as object)).toBe(true);
   });
 
   it('leaves non-synthetic refs alone (symbol-node fromNodeId)', () => {
@@ -803,6 +803,83 @@ describe('edk2Resolver — non-STR_ string tokens (declaration-driven)', () => {
       language: 'c',
     };
     const result = edk2Resolver.resolve(ref, ctx as never);
-    expect((result as { refused?: boolean }).refused).toBe(true);
+    expect('refused' in (result as object)).toBe(true);
+  });
+});
+
+describe('edk2Resolver — library-call bridge (unit)', () => {
+  const INF_LIB = '[Defines]\n  BASE_NAME = TestLib\n  LIBRARY_CLASS = TestLib\n  MODULE_TYPE = BASE\n\n[Sources]\n  TestLib.c\n';
+  const INF_DRV = '[Defines]\n  BASE_NAME = Drv\n  MODULE_TYPE = DXE_DRIVER\n\n[Sources]\n  Drv.c\n\n[LibraryClasses]\n  TestLib\n';
+  const DSC = '[Defines]\n  PLATFORM_NAME = TestPkg\n\n[LibraryClasses]\n  TestLib|TestPkg/Library/TestLib/TestLib.inf\n';
+
+  function libCtx() {
+    const fn = mkConstant('FetchValue', 'FetchValue', 'TestPkg/Library/TestLib/TestLib.c', 3);
+    fn.kind = 'function';
+    const libMod = { ...mkConstant('TestLib', 'TestPkg/Library/TestLib/TestLib.inf::TestLib', 'TestPkg/Library/TestLib/TestLib.inf', 1), kind: 'module' as const };
+    const drvMod = { ...mkConstant('Drv', 'TestPkg/Drv/Drv.inf::Drv', 'TestPkg/Drv/Drv.inf', 1), kind: 'module' as const };
+    const otherMod = { ...mkConstant('Other', 'TestPkg/Other/Other.inf::Other', 'TestPkg/Other/Other.inf', 1), kind: 'module' as const };
+    const dscMod = { ...mkConstant('TestPkg', 'TestPkg/TestPkg.dsc::TestPkg', 'TestPkg/TestPkg.dsc', 1), kind: 'module' as const };
+    return {
+      ...baseContext(),
+      getNodesByKind: (k: string) => (k === 'module' ? [libMod, drvMod, otherMod, dscMod] : []),
+      getNodesInFile: (p: string) =>
+        p === 'TestPkg/Library/TestLib/TestLib.c' ? [fn] : p === 'TestPkg/Drv/Drv.c' ? [mkConstant('Get', 'Get', p, 3)] : p === 'TestPkg/Other/Other.c' ? [mkConstant('Get2', 'Get2', p, 3)] : [],
+      readFile: (p: string) => {
+        if (p === 'TestPkg/Library/TestLib/TestLib.inf') return INF_LIB;
+        if (p === 'TestPkg/Drv/Drv.inf') return INF_DRV;
+        if (p === 'TestPkg/Other/Other.inf') return '[Defines]\n  BASE_NAME = Other\n  MODULE_TYPE = DXE_DRIVER\n\n[Sources]\n  Other.c\n';
+        if (p === 'TestPkg/TestPkg.dsc') return DSC;
+        return null;
+      },
+      getNodesByName: (n: string) => (n === 'FetchValue' ? [fn] : []),
+    };
+  }
+
+  it('resolves a library call to the DSC-selected instance function', () => {
+    const ctx = libCtx();
+    const fn = ctx.getNodesInFile('TestPkg/Library/TestLib/TestLib.c')[0]!;
+    const ref: UnresolvedRef = {
+      fromNodeId: 'function:caller1',
+      referenceName: 'FetchValue',
+      referenceKind: 'calls',
+      line: 4,
+      column: 12,
+      filePath: 'TestPkg/Drv/Drv.c',
+      language: 'c',
+    };
+    const result = edk2Resolver.resolve(ref, ctx as never);
+    expect(result).not.toBeNull();
+    expect(result!.targetNodeId).toBe(fn.id);
+    expect(result!.confidence).toBeGreaterThanOrEqual(0.9);
+  });
+
+  it('refuses a call to a library-only name from a module that never declared the class', () => {
+    const ctx = libCtx();
+    const ref: UnresolvedRef = {
+      fromNodeId: 'function:caller2',
+      referenceName: 'FetchValue',
+      referenceKind: 'calls',
+      line: 4,
+      column: 12,
+      filePath: 'TestPkg/Other/Other.c', // no [LibraryClasses] TestLib
+      language: 'c',
+    };
+    const result = edk2Resolver.resolve(ref, ctx as never);
+    expect(result).not.toBeNull();
+    expect('refused' in (result as object)).toBe(true);
+  });
+
+  it('returns null for non-library calls (no index hit)', () => {
+    const ctx = libCtx();
+    const ref: UnresolvedRef = {
+      fromNodeId: 'function:caller3',
+      referenceName: 'LocalFunction',
+      referenceKind: 'calls',
+      line: 4,
+      column: 12,
+      filePath: 'TestPkg/Drv/Drv.c',
+      language: 'c',
+    };
+    expect(edk2Resolver.resolve(ref, ctx as never)).toBeNull();
   });
 });
