@@ -735,7 +735,11 @@ export class Edk2Extractor {
     const lines = this.source.split('\n');
     const includeRe = /^\s*!include\s+(\S+)/;
     const libClassRe = /^([A-Za-z0-9_]+)\s*\|\s*(\S+\.inf)/;
-    const pcdRe = /^\s*(?:([A-Za-z0-9_]+)\.)?(Pcd[A-Za-z0-9_]+)\s*\|/;
+    // `TokenSpace.PcdName|Value` (or bare `PcdName|Value`) — same shape as
+    // DSC [Pcds*] rows. PCD names need NOT start with Pcd (Arm/Embedded
+    // platform PCDs like `gArmTokenSpaceGuid.PL011UartClkInHz|`); the
+    // declaration set gates admission at resolve time.
+    const pcdRe = /^\s*(?:([A-Za-z0-9_]+)\.)?([A-Za-z0-9_]+)\s*\|/;
     const infRe = /^\s*INF\s+(?:(?:RuleOverride|FILE_GUID)\s*=\s*\S+\s+)*(\S+\.inf)\s*$/i;
     for (let i = 0; i < lines.length; i++) {
       const text = lines[i]!.trim();

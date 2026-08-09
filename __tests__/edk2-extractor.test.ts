@@ -1012,3 +1012,16 @@ describe('Edk2Extractor — round-9: dedup, DSC block shapes', () => {
     expect(names).toContain('VendorPkg/Lib/PcdLib.inf');
   });
 });
+
+describe('Edk2Extractor — round-10: fragment PCD shapes', () => {
+  it('fragment PCD rows with non-Pcd names still emit (Arm shape)', () => {
+    const src = `gArmTokenSpaceGuid.PL011UartClkInHz|1|UINT32|0x1
+gEfiMdePkgTokenSpaceGuid.PcdDebugPrintErrorLevel|0x80000000
+`;
+    const result = extractFromSource('ArmPlatformPkg/ArmPlatformPkg.dsc.inc', CRLF(src), 'edk2');
+    const refs = result.unresolvedReferences.filter((r) => r.referenceName === 'PL011UartClkInHz');
+    expect(refs).toHaveLength(1);
+    expect(refs[0]!.candidates).toContain('gArmTokenSpaceGuid.PL011UartClkInHz');
+    expect(result.unresolvedReferences.some((r) => r.referenceName === 'PcdDebugPrintErrorLevel')).toBe(true);
+  });
+});

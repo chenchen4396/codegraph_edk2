@@ -234,12 +234,14 @@ export const edk2Resolver: FrameworkResolver = {
         if (!sets.guids.has(name)) {
           return refused(`GUID '${name}' is not declared in any DEC [Guids]/[Protocols]/[Ppis] section`);
         }
-      } else if (/^STR_[A-Za-z0-9_]+$/.test(name)) {
+      } else {
+        // Any non-g candidate is a STRING_TOKEN use — UEFI HII does not
+        // constrain token names (the corpus declares TPM_*, CONF_*, TCG_*,
+        // DISC_* … 169 non-STR_ tokens); the .uni declaration set is the
+        // authority, not a prefix convention.
         if (!sets.strings.has(name)) {
           return refused(`string token '${name}' is not declared in any .uni file`);
         }
-      } else {
-        return null; // not an EDK2 candidate shape — other strategies own it
       }
     }
 

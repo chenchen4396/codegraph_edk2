@@ -769,3 +769,40 @@ describe('edk2Resolver — declaration-set governance (RefusedRef)', () => {
     expect(edk2Resolver.resolve(ref, ctx as never)).toBeNull();
   });
 });
+
+describe('edk2Resolver — non-STR_ string tokens (declaration-driven)', () => {
+  it('resolves a TPM_ token to its UNI declaration (no STR_ prefix required)', () => {
+    const tok = mkConstant('TPM_DEVICE_ERROR', 'SecurityPkg/Tpm.uni::TPM_DEVICE_ERROR', 'SecurityPkg/Tpm.uni', 5);
+    const ctx = {
+      ...baseContext(),
+      getNodesByName: (n: string) => (n === 'TPM_DEVICE_ERROR' ? [tok] : []),
+      getNodesByKind: (k: string) => (k === 'constant' ? [tok] : []),
+    };
+    const ref: UnresolvedRef = {
+      fromNodeId: 'file:SecurityPkg/Tpm.c',
+      referenceName: 'TPM_DEVICE_ERROR',
+      referenceKind: 'references',
+      line: 3,
+      column: 10,
+      filePath: 'SecurityPkg/Tpm.c',
+      language: 'c',
+    };
+    const result = edk2Resolver.resolve(ref, ctx as never);
+    expect(result?.targetNodeId).toBe(tok.id);
+  });
+
+  it('refuses an undeclared non-STR_ token', () => {
+    const ctx = { ...baseContext(), getNodesByKind: () => [] };
+    const ref: UnresolvedRef = {
+      fromNodeId: 'file:X.c',
+      referenceName: 'TPM_NOT_DECLARED',
+      referenceKind: 'references',
+      line: 3,
+      column: 10,
+      filePath: 'X.c',
+      language: 'c',
+    };
+    const result = edk2Resolver.resolve(ref, ctx as never);
+    expect((result as { refused?: boolean }).refused).toBe(true);
+  });
+});
